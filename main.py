@@ -58,6 +58,50 @@ def init_db():
         db.commit()
     except Exception:
         pass  # Column already exists
+    # Migration: add avatar column
+    try:
+        db.execute("ALTER TABLE users ADD COLUMN avatar TEXT DEFAULT ''")
+        db.commit()
+    except Exception:
+        pass
+    # New tables
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS announcements (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            title      TEXT NOT NULL,
+            content    TEXT NOT NULL,
+            author     TEXT NOT NULL,
+            pinned     INTEGER DEFAULT 0,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            content  TEXT NOT NULL,
+            ts       INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS forum_posts (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            title      TEXT NOT NULL,
+            content    TEXT NOT NULL,
+            author     TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS forum_comments (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_id    INTEGER NOT NULL,
+            author     TEXT NOT NULL,
+            content    TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS cloud_files (
+            id         TEXT    PRIMARY KEY,
+            owner      TEXT    NOT NULL,
+            filename   TEXT    NOT NULL,
+            size       INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+    """)
     db.commit(); db.close()
 
 @asynccontextmanager
@@ -293,6 +337,236 @@ async def stats(_=Depends(require_admin)):
         fails_today  = db.execute("SELECT COUNT(*) FROM login_logs WHERE ts>? AND success=0", (day_ago,)).fetchone()[0]
         return {"total": total, "banned": banned, "admins": admins,
                 "active_24h": active, "logins_today": logins_today, "fails_today": fails_today}
+    finally:
+        db.close()
+
+# ── 用户 Profile ─────────────────────────────────────────────────────────────
+@app.get("/api/profile")
+async def get_profile(user=Depends(get_current_user)):
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT username,email,role,created_at,last_login,login_count,last_ip,device_info FROM users WHERE username=?",
+            (user["sub"],)).fetchone()
+        if not row: raise HTTPException(404, "用户不存在")
+        import json as _j
+        d = dict(row)
+        try: d["device_info"] = _j.loads(d["device_info"] or "{}")
+        except: d["device_info"] = {}
+        return d
+    finally:
+        db.close()
+
+@app.post("/api/profile/avatar")
+async def set_avatar(req: Request, user=Depends(get_current_user)):
+    body = await req.json()
+    avatar = str(body.get("avatar", ""))[:4]   # 最多4字符 emoji
+    db = get_db()
+    try:
+        db.execute("UPDATE users SET avatar=? WHERE username=?", (avatar, user["sub"]))
+        db.commit(); return {"message": "已更新"}
+    finally:
+        db.close()
+
+# ── 公告 ─────────────────────────────────────────────────────────────────────
+class AnnouncementReq(BaseModel):
+    title:   str
+    content: str
+    pinned:  bool = False
+
+@app.get("/api/announcements")
+async def list_announcements(user=Depends(get_current_user)):
+    db = get_db()
+    try:
+        rows = db.execute(
+            "SELECT id,title,content,author,pinned,created_at FROM announcements ORDER BY pinned DESC, id DESC LIMIT 50"
+        ).fetchall()
+        return {"items": [dict(r) for r in rows]}
+    finally:
+        db.close()
+
+@app.post("/api/announcements")
+async def post_announcement(req: AnnouncementReq, user=Depends(get_current_user)):
+    if user.get("role") != "admin": raise HTTPException(403, "仅管理员可发布公告")
+    db = get_db()
+    try:
+        db.execute("INSERT INTO announcements (title,content,author,pinned,created_at) VALUES (?,?,?,?,?)",
+                   (req.title, req.content, user["sub"], int(req.pinned), int(time.time())))
+        db.commit(); return {"message": "已发布"}
+    finally:
+        db.close()
+
+@app.delete("/api/announcements/{aid}")
+async def del_announcement(aid: int, user=Depends(get_current_user)):
+    if user.get("role") != "admin": raise HTTPException(403, "仅管理员可删除")
+    db = get_db()
+    try:
+        db.execute("DELETE FROM announcements WHERE id=?", (aid,))
+        db.commit(); return {"message": "已删除"}
+    finally:
+        db.close()
+
+# ── 聊天 ─────────────────────────────────────────────────────────────────────
+class ChatReq(BaseModel):
+    content: str
+
+@app.get("/api/chat")
+async def get_chat(since: int = 0, user=Depends(get_current_user)):
+    db = get_db()
+    try:
+        rows = db.execute(
+            "SELECT id,username,content,ts FROM chat_messages WHERE ts>? ORDER BY ts ASC LIMIT 100",
+            (since,)).fetchall()
+        return {"messages": [dict(r) for r in rows]}
+    finally:
+        db.close()
+
+@app.post("/api/chat")
+async def send_chat(req: ChatReq, user=Depends(get_current_user)):
+    content = req.content.strip()[:500]
+    if not content: raise HTTPException(400, "内容不能为空")
+    db = get_db()
+    try:
+        ts = int(time.time())
+        db.execute("INSERT INTO chat_messages (username,content,ts) VALUES (?,?,?)",
+                   (user["sub"], content, ts))
+        db.commit()
+        return {"id": db.execute("SELECT last_insert_rowid()").fetchone()[0], "ts": ts}
+    finally:
+        db.close()
+
+# ── 论坛 ─────────────────────────────────────────────────────────────────────
+class PostReq(BaseModel):
+    title:   str
+    content: str
+
+class CommentReq(BaseModel):
+    content: str
+
+@app.get("/api/forum/posts")
+async def list_posts(page: int = 1, user=Depends(get_current_user)):
+    db = get_db()
+    try:
+        per = 20
+        total = db.execute("SELECT COUNT(*) FROM forum_posts").fetchone()[0]
+        rows  = db.execute(
+            "SELECT p.id,p.title,p.author,p.created_at,"
+            "(SELECT COUNT(*) FROM forum_comments WHERE post_id=p.id) AS replies "
+            "FROM forum_posts p ORDER BY p.id DESC LIMIT ? OFFSET ?",
+            (per, (page-1)*per)).fetchall()
+        return {"total": total, "page": page, "posts": [dict(r) for r in rows]}
+    finally:
+        db.close()
+
+@app.post("/api/forum/posts")
+async def create_post(req: PostReq, user=Depends(get_current_user)):
+    title = req.title.strip()[:100]; content = req.content.strip()[:5000]
+    if not title or not content: raise HTTPException(400, "标题和内容不能为空")
+    db = get_db()
+    try:
+        db.execute("INSERT INTO forum_posts (title,content,author,created_at) VALUES (?,?,?,?)",
+                   (title, content, user["sub"], int(time.time())))
+        db.commit(); return {"message": "发布成功"}
+    finally:
+        db.close()
+
+@app.get("/api/forum/posts/{pid}")
+async def get_post(pid: int, user=Depends(get_current_user)):
+    db = get_db()
+    try:
+        post = db.execute("SELECT * FROM forum_posts WHERE id=?", (pid,)).fetchone()
+        if not post: raise HTTPException(404, "帖子不存在")
+        comments = db.execute(
+            "SELECT id,author,content,created_at FROM forum_comments WHERE post_id=? ORDER BY id ASC",
+            (pid,)).fetchall()
+        return {"post": dict(post), "comments": [dict(c) for c in comments]}
+    finally:
+        db.close()
+
+@app.post("/api/forum/posts/{pid}/comments")
+async def add_comment(pid: int, req: CommentReq, user=Depends(get_current_user)):
+    content = req.content.strip()[:1000]
+    if not content: raise HTTPException(400, "内容不能为空")
+    db = get_db()
+    try:
+        post = db.execute("SELECT id FROM forum_posts WHERE id=?", (pid,)).fetchone()
+        if not post: raise HTTPException(404, "帖子不存在")
+        db.execute("INSERT INTO forum_comments (post_id,author,content,created_at) VALUES (?,?,?,?)",
+                   (pid, user["sub"], content, int(time.time())))
+        db.commit(); return {"message": "回复成功"}
+    finally:
+        db.close()
+
+# ── 云盘 ─────────────────────────────────────────────────────────────────────
+CLOUD_DIR = os.environ.get("CLOUD_DIR", "cloud_files")
+os.makedirs(CLOUD_DIR, exist_ok=True)
+MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_MB", "50")) * 1024 * 1024
+
+@app.get("/api/cloud/files")
+async def list_cloud_files(user=Depends(get_current_user)):
+    db = get_db()
+    try:
+        rows = db.execute(
+            "SELECT id,filename,size,created_at FROM cloud_files WHERE owner=? ORDER BY id DESC",
+            (user["sub"],)).fetchall()
+        return {"files": [dict(r) for r in rows]}
+    finally:
+        db.close()
+
+@app.post("/api/cloud/upload")
+async def upload_file(request: Request, user=Depends(get_current_user)):
+    import json as _j2
+    body = await request.body()
+    try:
+        data = _j2.loads(body)
+        filename = str(data.get("filename","")).strip().replace("/","_").replace("\\","_")
+        import base64
+        file_bytes = base64.b64decode(data.get("data",""))
+    except Exception as e:
+        raise HTTPException(400, f"格式错误: {e}")
+    if not filename: raise HTTPException(400, "文件名不能为空")
+    if len(file_bytes) > MAX_FILE_SIZE:
+        raise HTTPException(413, f"文件过大，最大 {MAX_FILE_SIZE//1048576}MB")
+    db = get_db()
+    try:
+        # check quota: max 100 files per user
+        count = db.execute("SELECT COUNT(*) FROM cloud_files WHERE owner=?", (user["sub"],)).fetchone()[0]
+        if count >= 100: raise HTTPException(400, "云盘文件数量已达上限(100个)")
+        import uuid
+        fid  = str(uuid.uuid4())
+        path = os.path.join(CLOUD_DIR, fid)
+        with open(path, "wb") as f: f.write(file_bytes)
+        db.execute("INSERT INTO cloud_files (id,owner,filename,size,created_at) VALUES (?,?,?,?,?)",
+                   (fid, user["sub"], filename, len(file_bytes), int(time.time())))
+        db.commit()
+        return {"id": fid, "filename": filename, "size": len(file_bytes)}
+    finally:
+        db.close()
+
+@app.get("/api/cloud/download/{fid}")
+async def download_file(fid: str, user=Depends(get_current_user)):
+    db = get_db()
+    try:
+        row = db.execute("SELECT * FROM cloud_files WHERE id=? AND owner=?", (fid, user["sub"])).fetchone()
+        if not row: raise HTTPException(404, "文件不存在")
+        path = os.path.join(CLOUD_DIR, fid)
+        if not os.path.exists(path): raise HTTPException(404, "文件已丢失")
+        import base64
+        with open(path, "rb") as f: raw = f.read()
+        return {"filename": row["filename"], "data": base64.b64encode(raw).decode(), "size": len(raw)}
+    finally:
+        db.close()
+
+@app.delete("/api/cloud/files/{fid}")
+async def delete_cloud_file(fid: str, user=Depends(get_current_user)):
+    db = get_db()
+    try:
+        row = db.execute("SELECT id FROM cloud_files WHERE id=? AND owner=?", (fid, user["sub"])).fetchone()
+        if not row: raise HTTPException(404, "文件不存在")
+        path = os.path.join(CLOUD_DIR, fid)
+        if os.path.exists(path): os.remove(path)
+        db.execute("DELETE FROM cloud_files WHERE id=?", (fid,))
+        db.commit(); return {"message": "已删除"}
     finally:
         db.close()
 
