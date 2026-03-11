@@ -858,6 +858,8 @@ tr:hover td{background:#1a1f2e}
     </div>
   </div>
 </div>
+
+<script>
 let TOKEN = '', curPage = 1, logPage = 1, curTab = 'overview', editingUser = '';
 let searchTimer = null;
 
