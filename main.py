@@ -309,6 +309,55 @@ async def delete_user(username: str, _=Depends(require_admin)):
     finally:
         db.close()
 
+# ── Admin: 聊天删除 ───────────────────────────────────────────────────────────
+@app.delete("/api/chat/{msg_id}")
+async def delete_chat_msg(msg_id: int, user=Depends(get_current_user)):
+    if user.get("role") != "admin": raise HTTPException(403, "仅管理员可删除")
+    db = get_db()
+    try:
+        db.execute("DELETE FROM chat_messages WHERE id=?", (msg_id,))
+        db.commit(); return {"message": "已删除"}
+    finally:
+        db.close()
+
+# ── Admin: 论坛帖子删除 ───────────────────────────────────────────────────────
+@app.delete("/api/forum/posts/{pid}")
+async def delete_forum_post(pid: int, user=Depends(get_current_user)):
+    if user.get("role") != "admin": raise HTTPException(403, "仅管理员可删除")
+    db = get_db()
+    try:
+        db.execute("DELETE FROM forum_comments WHERE post_id=?", (pid,))
+        db.execute("DELETE FROM forum_posts WHERE id=?", (pid,))
+        db.commit(); return {"message": "已删除"}
+    finally:
+        db.close()
+
+# ── Admin: 云盘文件列表 & 删除 ────────────────────────────────────────────────
+@app.get("/admin/cloud/files")
+async def admin_list_cloud(username: str = "", _=Depends(require_admin)):
+    db = get_db()
+    try:
+        like = f"%{username}%"
+        rows = db.execute(
+            "SELECT id,owner,filename,size,created_at FROM cloud_files WHERE owner LIKE ? ORDER BY id DESC LIMIT 200",
+            (like,)).fetchall()
+        return {"files": [dict(r) for r in rows]}
+    finally:
+        db.close()
+
+@app.delete("/admin/cloud/files/{fid}")
+async def admin_delete_cloud(fid: str, _=Depends(require_admin)):
+    db = get_db()
+    try:
+        row = db.execute("SELECT id FROM cloud_files WHERE id=?", (fid,)).fetchone()
+        if not row: raise HTTPException(404, "文件不存在")
+        path = os.path.join(CLOUD_DIR, fid)
+        if os.path.exists(path): os.remove(path)
+        db.execute("DELETE FROM cloud_files WHERE id=?", (fid,))
+        db.commit(); return {"message": "已删除"}
+    finally:
+        db.close()
+
 @app.get("/admin/logs")
 async def get_logs(page: int = 1, username: str = "", _=Depends(require_admin)):
     db = get_db()
@@ -663,6 +712,10 @@ tr:hover td{background:#1a1f2e}
       <div class="nav-item active" id="nav-overview" onclick="showTab('overview')">📊 概览</div>
       <div class="nav-item" id="nav-users"    onclick="showTab('users')">👥 用户管理</div>
       <div class="nav-item" id="nav-logs"     onclick="showTab('logs')">📋 登录日志</div>
+      <div class="nav-item" id="nav-announce" onclick="showTab('announce')">📢 公告管理</div>
+      <div class="nav-item" id="nav-chat"     onclick="showTab('chat')">💬 聊天记录</div>
+      <div class="nav-item" id="nav-forum"    onclick="showTab('forum')">🗣 论坛管理</div>
+      <div class="nav-item" id="nav-cloud"    onclick="showTab('cloud')">☁️ 云盘管理</div>
     </div>
     <div class="content">
 
@@ -703,6 +756,41 @@ tr:hover td{background:#1a1f2e}
           <span id="logPageInfo" style="font-size:12px;color:#64748b"></span>
           <button class="page-btn" id="logNext" onclick="changeLogPage(1)">下页 →</button>
         </div>
+      </div>
+
+      <!-- 公告管理 -->
+      <div id="tab-announce" style="display:none">
+        <div class="toolbar">
+          <button class="sm-btn primary" onclick="openAnnounceModal()">+ 发布公告</button>
+        </div>
+        <div id="announceBody"></div>
+      </div>
+
+      <!-- 聊天记录 -->
+      <div id="tab-chat" style="display:none">
+        <div class="toolbar">
+          <input class="search" placeholder="按用户名筛选…" id="chatSearch" oninput="loadChat()">
+          <button class="sm-btn" onclick="loadChat()">刷新</button>
+        </div>
+        <div id="chatBody"></div>
+      </div>
+
+      <!-- 论坛管理 -->
+      <div id="tab-forum" style="display:none">
+        <div id="forumBody"></div>
+        <div class="page-row">
+          <button class="page-btn" id="forumPrev" onclick="changeForumPage(-1)">← 上页</button>
+          <span id="forumPageInfo" style="font-size:12px;color:#64748b"></span>
+          <button class="page-btn" id="forumNext" onclick="changeForumPage(1)">下页 →</button>
+        </div>
+      </div>
+
+      <!-- 云盘管理 -->
+      <div id="tab-cloud" style="display:none">
+        <div class="toolbar">
+          <input class="search" placeholder="按用户名筛选…" id="cloudSearch" oninput="loadCloud()">
+        </div>
+        <div id="cloudBody"></div>
       </div>
 
     </div>
@@ -754,7 +842,22 @@ tr:hover td{background:#1a1f2e}
   </div>
 </div>
 
-<script>
+<!-- 发布公告 modal -->
+<div class="modal-bg" id="announceModal" style="display:none" onclick="if(event.target===this)this.style.display='none'">
+  <div class="modal">
+    <h3>📢 发布公告</h3>
+    <label>标题</label><input id="ann-title" placeholder="公告标题">
+    <label>内容</label><textarea id="ann-content" placeholder="公告内容…" style="width:100%;height:100px;padding:9px;background:#0f1117;border:1px solid #2d3148;border-radius:8px;color:#e2e8f0;margin-top:4px;resize:vertical"></textarea>
+    <label style="display:flex;align-items:center;gap:8px;margin-top:12px;cursor:pointer">
+      <input type="checkbox" id="ann-pinned"> 置顶公告
+    </label>
+    <div class="err" id="ann-err"></div>
+    <div class="btn-row">
+      <button class="sm-btn" onclick="document.getElementById('announceModal').style.display='none'">取消</button>
+      <button class="sm-btn primary" onclick="doPostAnnounce()">发布</button>
+    </div>
+  </div>
+</div>
 let TOKEN = '', curPage = 1, logPage = 1, curTab = 'overview', editingUser = '';
 let searchTimer = null;
 
@@ -787,13 +890,17 @@ function logout() {
 
 function showTab(tab) {
   curTab = tab;
-  ['overview','users','logs'].forEach(t => {
+  ['overview','users','logs','announce','chat','forum','cloud'].forEach(t => {
     document.getElementById('tab-'+t).style.display = t===tab ? '' : 'none';
     document.getElementById('nav-'+t).classList.toggle('active', t===tab);
   });
   if (tab==='overview') loadOverview();
   if (tab==='users')    { curPage=1; loadUsers(); }
   if (tab==='logs')     { logPage=1; loadLogs(); }
+  if (tab==='announce') loadAnnouncements();
+  if (tab==='chat')     loadChat();
+  if (tab==='forum')    { forumPage=1; loadForum(); }
+  if (tab==='cloud')    loadCloud();
 }
 
 function fmtTime(ts) {
@@ -972,6 +1079,140 @@ async function loadLogs() {
 }
 
 function changeLogPage(d) { logPage += d; loadLogs(); }
+
+// ── 公告管理 ──────────────────────────────────────────────────────────────────
+async function loadAnnouncements() {
+  try {
+    const d = await api('GET', '/api/announcements');
+    const body = document.getElementById('announceBody');
+    if (!d.items.length) { body.innerHTML = '<p style="color:#64748b">暂无公告</p>'; return; }
+    body.innerHTML = '<table><thead><tr><th>ID</th><th>标题</th><th>内容</th><th>作者</th><th>置顶</th><th>时间</th><th>操作</th></tr></thead><tbody>' +
+      d.items.map(a => `<tr>
+        <td>${a.id}</td>
+        <td><b>${esc(a.title)}</b></td>
+        <td style="max-width:300px;word-break:break-all">${esc(a.content)}</td>
+        <td>${esc(a.author)}</td>
+        <td>${a.pinned ? '📌' : '—'}</td>
+        <td>${fmtTime(a.created_at)}</td>
+        <td><button class="sm-btn danger" onclick="delAnnounce(${a.id})">删除</button></td>
+      </tr>`).join('') + '</tbody></table>';
+  } catch(e) { document.getElementById('announceBody').innerHTML = `<p style="color:#ef4444">${e.message}</p>`; }
+}
+
+async function delAnnounce(id) {
+  if (!confirm('确认删除此公告？')) return;
+  try { await api('DELETE', `/api/announcements/${id}`); loadAnnouncements(); }
+  catch(e) { alert(e.message); }
+}
+
+function openAnnounceModal() {
+  document.getElementById('announceModal').style.display = 'flex';
+  document.getElementById('ann-title').value = '';
+  document.getElementById('ann-content').value = '';
+  document.getElementById('ann-pinned').checked = false;
+  document.getElementById('ann-err').textContent = '';
+}
+
+async function doPostAnnounce() {
+  const title = document.getElementById('ann-title').value.trim();
+  const content = document.getElementById('ann-content').value.trim();
+  const pinned = document.getElementById('ann-pinned').checked;
+  if (!title || !content) { document.getElementById('ann-err').textContent = '标题和内容不能为空'; return; }
+  try {
+    await api('POST', '/api/announcements', {title, content, pinned});
+    document.getElementById('announceModal').style.display = 'none';
+    loadAnnouncements();
+  } catch(e) { document.getElementById('ann-err').textContent = e.message; }
+}
+
+// ── 聊天记录 ──────────────────────────────────────────────────────────────────
+async function loadChat() {
+  const q = document.getElementById('chatSearch').value.trim();
+  try {
+    const d = await api('GET', '/api/chat?since=0');
+    const msgs = d.messages.filter(m => !q || m.username.includes(q));
+    const body = document.getElementById('chatBody');
+    if (!msgs.length) { body.innerHTML = '<p style="color:#64748b">暂无消息</p>'; return; }
+    body.innerHTML = '<table><thead><tr><th>ID</th><th>用户名</th><th>内容</th><th>时间</th><th>操作</th></tr></thead><tbody>' +
+      msgs.map(m => `<tr>
+        <td>${m.id}</td>
+        <td><b>${esc(m.username)}</b></td>
+        <td style="max-width:400px;word-break:break-all">${esc(m.content)}</td>
+        <td>${fmtTime(m.ts)}</td>
+        <td><button class="sm-btn danger" onclick="delChat(${m.id})">删除</button></td>
+      </tr>`).join('') + '</tbody></table>';
+  } catch(e) { document.getElementById('chatBody').innerHTML = `<p style="color:#ef4444">${e.message}</p>`; }
+}
+
+async function delChat(id) {
+  if (!confirm('确认删除此消息？')) return;
+  try { await api('DELETE', `/api/chat/${id}`); loadChat(); }
+  catch(e) { alert(e.message); }
+}
+
+// ── 论坛管理 ──────────────────────────────────────────────────────────────────
+let forumPage = 1;
+async function loadForum() {
+  try {
+    const d = await api('GET', `/api/forum/posts?page=${forumPage}`);
+    const totalPages = Math.max(1, Math.ceil(d.total / 20));
+    document.getElementById('forumPageInfo').textContent = `第 ${forumPage}/${totalPages} 页，共 ${d.total} 帖`;
+    document.getElementById('forumPrev').disabled = forumPage <= 1;
+    document.getElementById('forumNext').disabled = forumPage >= totalPages;
+    const body = document.getElementById('forumBody');
+    if (!d.posts.length) { body.innerHTML = '<p style="color:#64748b">暂无帖子</p>'; return; }
+    body.innerHTML = '<table><thead><tr><th>ID</th><th>标题</th><th>作者</th><th>回复数</th><th>时间</th><th>操作</th></tr></thead><tbody>' +
+      d.posts.map(p => `<tr>
+        <td>${p.id}</td>
+        <td>${esc(p.title)}</td>
+        <td>${esc(p.author)}</td>
+        <td>${p.replies}</td>
+        <td>${fmtTime(p.created_at)}</td>
+        <td><button class="sm-btn danger" onclick="delPost(${p.id})">删除</button></td>
+      </tr>`).join('') + '</tbody></table>';
+  } catch(e) { document.getElementById('forumBody').innerHTML = `<p style="color:#ef4444">${e.message}</p>`; }
+}
+
+async function delPost(id) {
+  if (!confirm('确认删除此帖子及所有回复？')) return;
+  try { await api('DELETE', `/api/forum/posts/${id}`); loadForum(); }
+  catch(e) { alert(e.message); }
+}
+function changeForumPage(d) { forumPage += d; loadForum(); }
+
+// ── 云盘管理 ──────────────────────────────────────────────────────────────────
+async function loadCloud() {
+  const q = document.getElementById('cloudSearch').value.trim();
+  try {
+    const d = await api('GET', `/admin/cloud/files${q ? '?username=' + encodeURIComponent(q) : ''}`);
+    const body = document.getElementById('cloudBody');
+    if (!d.files.length) { body.innerHTML = '<p style="color:#64748b">暂无文件</p>'; return; }
+    body.innerHTML = '<table><thead><tr><th>文件名</th><th>所有者</th><th>大小</th><th>上传时间</th><th>操作</th></tr></thead><tbody>' +
+      d.files.map(f => `<tr>
+        <td>${esc(f.filename)}</td>
+        <td>${esc(f.owner)}</td>
+        <td>${fmtSize(f.size)}</td>
+        <td>${fmtTime(f.created_at)}</td>
+        <td><button class="sm-btn danger" onclick="delCloudFile('${f.id}','${esc(f.owner)}')">删除</button></td>
+      </tr>`).join('') + '</tbody></table>';
+  } catch(e) { document.getElementById('cloudBody').innerHTML = `<p style="color:#ef4444">${e.message}</p>`; }
+}
+
+async function delCloudFile(id, owner) {
+  if (!confirm(`确认删除 ${owner} 的文件？`)) return;
+  try { await api('DELETE', `/admin/cloud/files/${id}`); loadCloud(); }
+  catch(e) { alert(e.message); }
+}
+
+function fmtSize(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  return (b/1048576).toFixed(1) + ' MB';
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
 </script>
 </body>
 </html>
