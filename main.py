@@ -39,8 +39,11 @@ def init_db():
             created_at  INTEGER NOT NULL,
             last_login  INTEGER,
             login_count INTEGER DEFAULT 0,
-            last_ip     TEXT    DEFAULT ''
+            last_ip     TEXT    DEFAULT '',
+            device_info TEXT    DEFAULT '{}'
         );
+        -- migrate: add column if upgrading from old schema
+        SELECT 1;
         CREATE TABLE IF NOT EXISTS login_logs (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             username   TEXT NOT NULL,
@@ -49,6 +52,12 @@ def init_db():
             ts         INTEGER NOT NULL
         );
     """)
+    # Migration: add device_info column if it doesn't exist yet
+    try:
+        db.execute("ALTER TABLE users ADD COLUMN device_info TEXT DEFAULT '{}'")
+        db.commit()
+    except Exception:
+        pass  # Column already exists
     db.commit(); db.close()
 
 @asynccontextmanager
@@ -111,11 +120,13 @@ def fmt_time(ts: Optional[int]) -> str:
 class LoginReq(BaseModel):
     username: str
     password: str
+    device:   dict = {}
 
 class RegisterReq(BaseModel):
     username: str
     password: str
     email:    str = ""
+    device:   dict = {}
 
 class AdminLoginReq(BaseModel):
     password: str
@@ -138,9 +149,10 @@ async def register(req: RegisterReq, request: Request):
         raise HTTPException(400, "密码至少4个字符")
     db = get_db()
     try:
+        import json as _json
         db.execute(
-            "INSERT INTO users (username,pw_hash,email,created_at) VALUES (?,?,?,?)",
-            (req.username.strip(), hash_pw(req.password), req.email, int(time.time()))
+            "INSERT INTO users (username,pw_hash,email,created_at,device_info) VALUES (?,?,?,?,?)",
+            (req.username.strip(), hash_pw(req.password), req.email, int(time.time()), _json.dumps(req.device, ensure_ascii=False))
         )
         db.commit()
         token = make_token(req.username, "user")
@@ -163,9 +175,10 @@ async def login(req: LoginReq, request: Request):
             log_login(db, req.username, ip, False)
             raise HTTPException(403, "账户已被封禁")
         # 更新登录信息
+        import json as _json2
         db.execute(
-            "UPDATE users SET last_login=?, login_count=login_count+1, last_ip=? WHERE username=?",
-            (int(time.time()), ip, req.username)
+            "UPDATE users SET last_login=?, login_count=login_count+1, last_ip=?, device_info=? WHERE username=?",
+            (int(time.time()), ip, _json2.dumps(req.device, ensure_ascii=False), req.username)
         )
         log_login(db, req.username, ip, True)
         db.commit()
@@ -217,7 +230,7 @@ async def list_users(page: int = 1, q: str = "", _=Depends(require_admin)):
         like = f"%{q}%"
         total = db.execute("SELECT COUNT(*) FROM users WHERE username LIKE ? OR email LIKE ?", (like,like)).fetchone()[0]
         rows  = db.execute(
-            "SELECT id,username,email,role,banned,created_at,last_login,login_count,last_ip "
+            "SELECT id,username,email,role,banned,created_at,last_login,login_count,last_ip,device_info "
             "FROM users WHERE username LIKE ? OR email LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?",
             (like, like, per, (page-1)*per)
         ).fetchall()
@@ -456,6 +469,17 @@ tr:hover td{background:#1a1f2e}
   </div>
 </div>
 
+<!-- 设备信息 modal -->
+<div class="modal-bg" id="deviceModal" style="display:none" onclick="if(event.target===this)this.style.display='none'">
+  <div class="modal" style="width:380px">
+    <h3>📱 设备信息：<span id="deviceUsername"></span></h3>
+    <div id="deviceBody" style="margin-top:12px;font-size:13px;line-height:2"></div>
+    <div class="btn-row" style="margin-top:16px">
+      <button class="sm-btn" onclick="document.getElementById('deviceModal').style.display='none'">关闭</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let TOKEN = '', curPage = 1, logPage = 1, curTab = 'overview', editingUser = '';
 let searchTimer = null;
@@ -503,6 +527,48 @@ function fmtTime(ts) {
   return new Date(ts*1000).toLocaleString('zh-CN',{hour12:false});
 }
 
+function fmtDevice(raw) {
+  if (!raw) return '—';
+  try {
+    const d = JSON.parse(raw);
+    if (!d || Object.keys(d).length === 0) return '—';
+    return (d.model || d.os || '未知设备').substring(0, 24);
+  } catch(e) { return '—'; }
+}
+
+function showDevice(u) {
+  document.getElementById('deviceUsername').textContent = u.username;
+  let html = '';
+  try {
+    const d = u.device_info ? JSON.parse(u.device_info) : {};
+    const fmtBytes = b => b > 0 ? (b >= 1073741824 ? (b/1073741824).toFixed(1)+'GB' : (b/1048576).toFixed(0)+'MB') : '—';
+    const rows = [
+      ['操作系统',   d.os],
+      ['设备型号',   d.model],
+      ['CPU',       d.cpu],
+      ['CPU核心',   d.cpu_cores ? d.cpu_cores+'核' : null],
+      ['CPU架构',   d.cpu_arch],
+      ['内存',      fmtBytes(d.ram_total)],
+      ['可用存储',  fmtBytes(d.storage_free)],
+      ['本地IP',    d.local_ip],
+      ['语言区域',  d.locale],
+      ['引擎版本',  d.godot_ver ? 'Godot '+d.godot_ver : null],
+    ];
+    for (const [k, v] of rows) {
+      if (v && v !== '—') {
+        html += `<div style="display:flex;gap:8px;border-bottom:1px solid #1a1f2e;padding:4px 0">
+          <span style="color:#64748b;min-width:80px">${k}</span>
+          <span>${v}</span></div>`;
+      }
+    }
+    if (!html) html = '<span style="color:#64748b">暂无设备数据（旧版客户端）</span>';
+  } catch(e) {
+    html = '<span style="color:#64748b">数据解析失败</span>';
+  }
+  document.getElementById('deviceBody').innerHTML = html;
+  document.getElementById('deviceModal').style.display = 'flex';
+}
+
 // ── 概览 ──
 async function loadOverview() {
   try {
@@ -542,9 +608,13 @@ async function loadUsers() {
         <td>${u.banned ? '<span class="badge banned">封禁</span>' : '<span style="color:#4ade80">正常</span>'}</td>
         <td>${u.login_count}</td>
         <td>${fmtTime(u.last_login)}</td>
+        <td style="font-size:11px;max-width:140px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">
+          ${fmtDevice(u.device_info)}
+        </td>
         <td><span class="ip-tag">${u.last_ip||'—'}</span></td>
         <td style="white-space:nowrap">
           <button class="sm-btn" onclick="openEdit(${JSON.stringify(u).replace(/"/g,'&quot;')})">编辑</button>
+          <button class="sm-btn" onclick="showDevice(${JSON.stringify(u).replace(/"/g,'&quot;')})">📱</button>
           <button class="sm-btn danger" onclick="delUser('${u.username}')">删除</button>
         </td>
       </tr>
