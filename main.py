@@ -64,6 +64,12 @@ def init_db():
         db.commit()
     except Exception:
         pass
+    # Migration: add vip column
+    try:
+        db.execute("ALTER TABLE users ADD COLUMN vip INTEGER DEFAULT 0")
+        db.commit()
+    except Exception:
+        pass
     # New tables
     db.executescript("""
         CREATE TABLE IF NOT EXISTS announcements (
@@ -199,6 +205,7 @@ class UpdateUserReq(BaseModel):
     banned:   Optional[bool] = None
     password: Optional[str]  = None
     avatar:   Optional[str]  = None   # base64图片或""（清除）
+    vip:      Optional[bool] = None
 
 class ChangePasswordReq(BaseModel):
     old_password: str
@@ -315,7 +322,7 @@ async def list_users(page: int = 1, q: str = "", _=Depends(require_admin)):
         like = f"%{q}%"
         total = db.execute("SELECT COUNT(*) FROM users WHERE username LIKE ? OR email LIKE ?", (like,like)).fetchone()[0]
         rows  = db.execute(
-            "SELECT id,username,email,role,banned,created_at,last_login,login_count,last_ip,avatar "
+            "SELECT id,username,email,role,banned,created_at,last_login,login_count,last_ip,avatar,vip "
             "FROM users WHERE username LIKE ? OR email LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?",
             (like, like, per, (page-1)*per)
         ).fetchall()
@@ -361,6 +368,8 @@ async def update_user(username: str, req: UpdateUserReq, _=Depends(require_admin
         if req.avatar is not None:
             if len(req.avatar) > 400_000: raise HTTPException(400, "头像数据过大")
             fields.append("avatar=?"); vals.append(req.avatar)
+        if req.vip is not None:
+            fields.append("vip=?"); vals.append(int(req.vip))
         if not fields: raise HTTPException(400, "无更新内容")
         vals.append(username)
         db.execute(f"UPDATE users SET {','.join(fields)} WHERE username=?", vals)
@@ -415,6 +424,38 @@ async def admin_list_cloud(username: str = "", page: int = 1, _=Depends(require_
             (like, per, (page-1)*per)).fetchall()
         pages = max(1, (total + per - 1) // per)
         return {"files": [dict(r) for r in rows], "total": total, "page": page, "pages": pages}
+    finally:
+        db.close()
+
+@app.post("/admin/cloud/upload")
+async def admin_upload_cloud(request: Request, _=Depends(require_admin)):
+    """管理员向任意用户云盘上传文件"""
+    import json as _jau, base64 as _bau, uuid as _uau
+    body = await request.body()
+    try:
+        data     = _jau.loads(body)
+        owner    = str(data.get("owner", "")).strip()
+        filename = str(data.get("filename", "")).strip().replace("/", "_").replace("\\", "_")
+        file_bytes = _bau.b64decode(data.get("data", ""))
+    except Exception as e:
+        raise HTTPException(400, f"格式错误: {e}")
+    if not owner:    raise HTTPException(400, "请指定目标用户名")
+    if not filename: raise HTTPException(400, "文件名不能为空")
+    if len(file_bytes) > MAX_FILE_SIZE:
+        raise HTTPException(413, f"文件过大，最大 {MAX_FILE_SIZE // 1048576} MB")
+    db = get_db()
+    try:
+        if not db.execute("SELECT 1 FROM users WHERE username=?", (owner,)).fetchone():
+            raise HTTPException(404, f"用户 {owner} 不存在")
+        fid      = str(_uau.uuid4())
+        user_dir = os.path.join(CLOUD_DIR, owner)
+        os.makedirs(user_dir, exist_ok=True)
+        with open(os.path.join(user_dir, fid), "wb") as f:
+            f.write(file_bytes)
+        db.execute("INSERT INTO cloud_files (id,owner,filename,size,created_at) VALUES (?,?,?,?,?)",
+                   (fid, owner, filename, len(file_bytes), int(time.time())))
+        db.commit()
+        return {"id": fid, "filename": filename, "size": len(file_bytes), "owner": owner}
     finally:
         db.close()
 
@@ -779,7 +820,7 @@ async def get_profile(user=Depends(get_current_user)):
     db = get_db()
     try:
         row = db.execute(
-            "SELECT username,email,role,created_at,last_login,login_count,last_ip,device_info,avatar FROM users WHERE username=?",
+            "SELECT username,email,role,created_at,last_login,login_count,last_ip,device_info,avatar,vip FROM users WHERE username=?",
             (user["sub"],)).fetchone()
         if not row: raise HTTPException(404, "用户不存在")
         import json as _j
@@ -852,7 +893,11 @@ async def cloud_stats(user=Depends(get_current_user)):
         row = db.execute(
             "SELECT COUNT(*) as cnt, COALESCE(SUM(size),0) as total FROM cloud_files WHERE owner=?",
             (user["sub"],)).fetchone()
-        return {"count": row["cnt"], "total_bytes": row["total"]}
+        urow   = db.execute("SELECT vip FROM users WHERE username=?", (user["sub"],)).fetchone()
+        is_vip = bool(urow["vip"]) if urow else False
+        quota  = CLOUD_QUOTA_VIP if is_vip else CLOUD_QUOTA_NORMAL
+        return {"count": row["cnt"], "total_bytes": row["total"],
+                "quota_bytes": quota, "is_vip": is_vip}
     finally:
         db.close()
 
@@ -994,9 +1039,11 @@ async def add_comment(pid: int, req: CommentReq, user=Depends(get_current_user))
         db.close()
 
 # ── 云盘 ─────────────────────────────────────────────────────────────────────
-CLOUD_DIR = os.environ.get("CLOUD_DIR", "cloud_files")
+CLOUD_DIR          = os.environ.get("CLOUD_DIR", "cloud_files")
 os.makedirs(CLOUD_DIR, exist_ok=True)
-MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_MB", "50")) * 1024 * 1024
+MAX_FILE_SIZE      = int(os.environ.get("MAX_FILE_MB",        "50"))    * 1024 * 1024
+CLOUD_QUOTA_NORMAL = int(os.environ.get("CLOUD_QUOTA_MB",     "500"))   * 1024 * 1024  # 普通用户 500 MB
+CLOUD_QUOTA_VIP    = int(os.environ.get("CLOUD_QUOTA_VIP_MB", "51200")) * 1024 * 1024  # VIP  50 GB
 
 @app.get("/api/cloud/files")
 async def list_cloud_files(user=Depends(get_current_user)):
@@ -1025,9 +1072,17 @@ async def upload_file(request: Request, user=Depends(get_current_user)):
         raise HTTPException(413, f"文件过大，最大 {MAX_FILE_SIZE//1048576}MB")
     db = get_db()
     try:
-        # check quota: max 100 files per user
+        urow   = db.execute("SELECT vip FROM users WHERE username=?", (user["sub"],)).fetchone()
+        is_vip = bool(urow["vip"]) if urow else False
+        quota  = CLOUD_QUOTA_VIP if is_vip else CLOUD_QUOTA_NORMAL
+        used   = db.execute("SELECT COALESCE(SUM(size),0) FROM cloud_files WHERE owner=?",
+                            (user["sub"],)).fetchone()[0]
+        if used + len(file_bytes) > quota:
+            raise HTTPException(400, f"云盘空间不足（配额 {quota//(1024*1024)} MB）")
+        # 普通用户限 200 个文件，VIP 不限
         count = db.execute("SELECT COUNT(*) FROM cloud_files WHERE owner=?", (user["sub"],)).fetchone()[0]
-        if count >= 100: raise HTTPException(400, "云盘文件数量已达上限(100个)")
+        if not is_vip and count >= 200:
+            raise HTTPException(400, "云盘文件数量已达上限 (200个)")
         import uuid
         fid      = str(uuid.uuid4())
         user_dir = os.path.join(CLOUD_DIR, user["sub"])
@@ -1154,6 +1209,9 @@ tr:hover td{background:#252840}
 .tag-user{background:#253040;color:#7ab4d8}
 .tag-banned{background:#4a2020;color:#f08080}
 .tag-pinned{background:#3a4a20;color:#aadd70}
+.tag-vip{background:linear-gradient(135deg,#7c4a00,#c8860a);color:#ffd700;border:1px solid #9a6800;text-shadow:0 0 6px #ffd70066}
+@keyframes vip-shimmer{0%,100%{opacity:1}50%{opacity:.7}}
+.vip-badge{display:inline-flex;align-items:center;gap:3px;padding:2px 7px;border-radius:10px;font-size:11px;font-weight:700;background:linear-gradient(135deg,#7c4a00,#c8860a);color:#ffd700;border:1px solid #9a6800;animation:vip-shimmer 2s ease-in-out infinite;white-space:nowrap}
 /* Modal */
 .modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;align-items:center;justify-content:center}
 .modal-bg.open{display:flex}
@@ -1311,6 +1369,23 @@ tr:hover td{background:#252840}
 
     <!-- CLOUD -->
     <div id="tab-cloud" style="display:none">
+      <!-- 管理员上传区 -->
+      <div class="panel" style="margin-bottom:16px">
+        <h2 style="margin-bottom:14px">📤 上传文件到用户云盘</h2>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">
+          <div style="flex:1;min-width:150px">
+            <label style="font-size:12px;color:#a0aec0;display:block;margin-bottom:5px">目标用户名</label>
+            <input id="adminUploadUser" placeholder="用户名..." style="width:100%">
+          </div>
+          <div style="flex:2;min-width:220px">
+            <label style="font-size:12px;color:#a0aec0;display:block;margin-bottom:5px">选择文件（≤50 MB）</label>
+            <input type="file" id="adminUploadFile" style="width:100%;padding:8px;background:#252840;border:1px solid #2d3148;border-radius:8px;color:#e2e8f0">
+          </div>
+          <button class="btn-primary" id="adminUploadBtn" onclick="adminUploadCloud()" style="padding:10px 22px;white-space:nowrap">⬆ 上传</button>
+        </div>
+        <div id="adminUploadStatus" style="margin-top:8px;font-size:12px;min-height:18px"></div>
+      </div>
+      <!-- 文件列表 -->
       <div class="panel">
         <h2>☁️ 云盘文件管理</h2>
         <div class="toolbar">
@@ -1442,6 +1517,19 @@ tr:hover td{background:#252840}
   <div class="row"><label>角色</label><select id="editRole"><option value="user">普通用户</option><option value="admin">管理员</option></select></div>
   <div class="row"><label>新密码（留空不改）</label><input type="password" id="editPassword" placeholder="新密码"></div>
   <div class="row" id="banRow"><label>封禁</label><select id="editBanned"><option value="0">正常</option><option value="1">封禁</option></select></div>
+  <div class="row" style="display:flex;align-items:center;gap:12px;padding:10px 14px;background:#161824;border-radius:10px;border:1px solid #2d3148">
+    <span style="font-size:20px">👑</span>
+    <div style="flex:1">
+      <div style="font-size:13px;font-weight:600;color:#ffd700">VIP 会员</div>
+      <div style="font-size:11px;color:#a0aec0;margin-top:2px">开启后：50 GB 云盘 · 无限文件数 · 专属标识</div>
+    </div>
+    <label style="position:relative;display:inline-block;width:44px;height:24px;flex-shrink:0">
+      <input type="checkbox" id="editVip" style="opacity:0;width:0;height:0;position:absolute">
+      <span id="editVipSlider" style="position:absolute;inset:0;border-radius:24px;background:#2d3148;cursor:pointer;transition:.25s;border:1px solid #3a3a5a">
+        <span style="position:absolute;left:3px;top:3px;width:16px;height:16px;border-radius:50%;background:#a0aec0;transition:.25s;display:block" id="editVipThumb"></span>
+      </span>
+    </label>
+  </div>
   <div id="userModalErr" style="color:#f08080;font-size:13px;margin-bottom:8px"></div>
   <div class="modal-footer">
     <button class="btn-secondary" onclick="closeModal('userModal')">取消</button>
@@ -1593,17 +1681,18 @@ async function loadUsers(page=1) {
       const avHtml = u.avatar && u.avatar.length > 50
         ? `<div class="av"><img src="data:image/png;base64,${u.avatar}" onerror="this.parentElement.textContent='${esc(u.username).charAt(0).toUpperCase()}'"></div>`
         : `<div class="av">${esc(u.avatar||u.username.charAt(0).toUpperCase())}</div>`;
+      const vipBadge = u.vip ? `<span class="vip-badge">👑 VIP</span> ` : '';
       return `<tr>
         <td>${avHtml}</td>
         <td><strong>${esc(u.username)}</strong></td>
         <td>${esc(u.email||'—')}</td>
-        <td><span class="tag ${u.role==='admin'?'tag-admin':'tag-user'}">${u.role}</span></td>
+        <td>${vipBadge}<span class="tag ${u.role==='admin'?'tag-admin':'tag-user'}">${u.role}</span></td>
         <td>${u.login_count}</td>
         <td>${fmtTs(u.last_login)}</td>
         <td>${esc(u.last_ip||'—')}</td>
         <td>${u.banned?'<span class="tag tag-banned">封禁</span>':'<span style="color:#48bb78;font-size:12px">正常</span>'}</td>
         <td style="white-space:nowrap">
-          <button class="btn-secondary btn-sm" onclick="editUser('${esc(u.username)}','${esc(u.email||'')}','${u.role}',${u.banned},'${u.avatar && u.avatar.length > 50 ? '__img__' : esc(u.avatar||'')}','${u.avatar && u.avatar.length > 50 ? u.avatar : ''}')">编辑</button>
+          <button class="btn-secondary btn-sm" onclick="editUser('${esc(u.username)}','${esc(u.email||'')}','${u.role}',${u.banned},'${u.avatar && u.avatar.length > 50 ? '__img__' : esc(u.avatar||'')}','${u.avatar && u.avatar.length > 50 ? u.avatar : ''}',${u.vip||0})">编辑</button>
           <button class="btn-danger btn-sm" onclick="delUser('${esc(u.username)}')">删除</button>
         </td>
       </tr>`;
@@ -1612,7 +1701,7 @@ async function loadUsers(page=1) {
   } catch(e) { toast('加载失败: '+e.message, true); }
 }
 
-function editUser(uname, email, role, banned, avShort, avB64) {
+function editUser(uname, email, role, banned, avShort, avB64, vip) {
   document.getElementById('editUsername').value = uname;
   document.getElementById('editEmail').value = email;
   document.getElementById('editRole').value = role;
@@ -1623,6 +1712,10 @@ function editUser(uname, email, role, banned, avShort, avB64) {
   document.getElementById('editAvStatus').textContent = '';
   document.getElementById('userModalTitle').textContent = '编辑用户 — ' + uname;
   document.getElementById('userModalErr').textContent = '';
+  // VIP toggle
+  const vipCb = document.getElementById('editVip');
+  vipCb.checked = !!vip;
+  _syncVipSlider(!!vip);
   // render avatar preview
   const prev = document.getElementById('editAvPreview');
   if (avB64 && avB64.length > 50) {
@@ -1632,6 +1725,21 @@ function editUser(uname, email, role, banned, avShort, avB64) {
   }
   openModal('userModal');
 }
+
+function _syncVipSlider(on) {
+  const slider = document.getElementById('editVipSlider');
+  const thumb  = document.getElementById('editVipThumb');
+  if (!slider || !thumb) return;
+  slider.style.background = on ? 'linear-gradient(135deg,#7c4a00,#c8860a)' : '#2d3148';
+  slider.style.borderColor = on ? '#9a6800' : '#3a3a5a';
+  thumb.style.background   = on ? '#ffd700' : '#a0aec0';
+  thumb.style.transform    = on ? 'translateX(20px)' : 'translateX(0)';
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  const cb = document.getElementById('editVip');
+  if (cb) cb.addEventListener('change', () => _syncVipSlider(cb.checked));
+});
 
 function previewAvatar(input) {
   const file = input.files[0];
@@ -1664,6 +1772,7 @@ async function saveUser() {
     email: document.getElementById('editEmail').value || null,
     role: document.getElementById('editRole').value,
     banned: parseInt(document.getElementById('editBanned').value),
+    vip: document.getElementById('editVip').checked,
   };
   const pw = document.getElementById('editPassword').value;
   if (pw) body.password = pw;
@@ -1949,6 +2058,38 @@ async function delCloudFile(id, owner) {
   if (!confirm(`确认删除 ${owner} 的文件？`)) return;
   try { await api('DELETE', `/admin/cloud/files/${id}`); toast('已删除'); loadCloud(cloudPage); }
   catch(e) { toast(e.message, true); }
+}
+
+async function adminUploadCloud() {
+  const btn      = document.getElementById('adminUploadBtn');
+  const status   = document.getElementById('adminUploadStatus');
+  const userVal  = document.getElementById('adminUploadUser').value.trim();
+  const fileInput = document.getElementById('adminUploadFile');
+  const file     = fileInput.files[0];
+  if (!userVal) { status.innerHTML='<span style="color:#f08080">⚠ 请输入目标用户名</span>'; return; }
+  if (!file)    { status.innerHTML='<span style="color:#f08080">⚠ 请选择文件</span>'; return; }
+  if (file.size > 50 * 1024 * 1024) { status.innerHTML='<span style="color:#f08080">⚠ 文件超过 50 MB</span>'; return; }
+  btn.disabled = true; btn.textContent = '⏳ 上传中…';
+  status.innerHTML = '<span style="color:#a0aec0">读取文件中…</span>';
+  try {
+    const b64 = await new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = e => res(e.target.result.split(',')[1]);
+      r.onerror = () => rej(new Error('文件读取失败'));
+      r.readAsDataURL(file);
+    });
+    status.innerHTML = '<span style="color:#a0aec0">上传中…</span>';
+    const d = await api('POST', '/admin/cloud/upload', {
+      owner: userVal, filename: file.name, data: b64
+    });
+    status.innerHTML = `<span style="color:#48bb78">✅ 已上传到 ${esc(d.owner)} 的云盘（${fmtSize(d.size)}）</span>`;
+    fileInput.value = '';
+    loadCloud(cloudPage);
+  } catch(e) {
+    status.innerHTML = `<span style="color:#f08080">❌ ${esc(e.message)}</span>`;
+  } finally {
+    btn.disabled = false; btn.textContent = '⬆ 上传';
+  }
 }
 
 // ── HELPERS ───────────────────────────────────────────────────────────────────
