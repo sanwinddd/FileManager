@@ -410,7 +410,11 @@ async def get_profile(user=Depends(get_current_user)):
 @app.post("/api/profile/avatar")
 async def set_avatar(req: Request, user=Depends(get_current_user)):
     body = await req.json()
-    avatar = str(body.get("avatar", ""))[:8]
+    avatar = str(body.get("avatar", ""))
+    MAX_B64 = 400_000  # ~300KB image
+    if len(avatar) > MAX_B64:
+        raise HTTPException(400, "图片太大，请使用小于 300KB 的图片")
+    # accept either base64 image data or short emoji/text
     db = get_db()
     try:
         db.execute("UPDATE users SET avatar=? WHERE username=?", (avatar, user["sub"]))
