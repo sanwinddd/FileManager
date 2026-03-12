@@ -176,9 +176,10 @@ class AdminLoginReq(BaseModel):
     password: str
 
 class UpdateUserReq(BaseModel):
-    email:  Optional[str]  = None
-    role:   Optional[str]  = None
-    banned: Optional[bool] = None
+    email:    Optional[str]  = None
+    role:     Optional[str]  = None
+    banned:   Optional[bool] = None
+    password: Optional[str]  = None
 
 class ChangePasswordReq(BaseModel):
     old_password: str
@@ -274,12 +275,35 @@ async def list_users(page: int = 1, q: str = "", _=Depends(require_admin)):
         like = f"%{q}%"
         total = db.execute("SELECT COUNT(*) FROM users WHERE username LIKE ? OR email LIKE ?", (like,like)).fetchone()[0]
         rows  = db.execute(
-            "SELECT id,username,email,role,banned,created_at,last_login,login_count,last_ip,device_info "
+            "SELECT id,username,email,role,banned,created_at,last_login,login_count,last_ip,avatar "
             "FROM users WHERE username LIKE ? OR email LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?",
             (like, like, per, (page-1)*per)
         ).fetchall()
-        return {"total": total, "page": page, "per": per,
+        pages = max(1, (total + per - 1) // per)
+        return {"total": total, "page": page, "per": per, "pages": pages,
                 "users": [dict(r) for r in rows]}
+    finally:
+        db.close()
+
+class CreateUserReq(BaseModel):
+    username: str
+    password: str
+    email: Optional[str] = None
+    role: str = "user"
+
+@app.post("/admin/users")
+async def create_user_admin(req: CreateUserReq, _=Depends(require_admin)):
+    db = get_db()
+    try:
+        if db.execute("SELECT 1 FROM users WHERE username=?", (req.username,)).fetchone():
+            raise HTTPException(400, "用户名已存在")
+        if len(req.username) < 2: raise HTTPException(400, "用户名至少2位")
+        if len(req.password) < 4: raise HTTPException(400, "密码至少4位")
+        db.execute(
+            "INSERT INTO users (username,pw_hash,email,role,created_at) VALUES (?,?,?,?,?)",
+            (req.username, hash_pw(req.password), req.email or "", req.role, int(time.time()))
+        )
+        db.commit(); return {"message": "已创建"}
     finally:
         db.close()
 
@@ -288,9 +312,12 @@ async def update_user(username: str, req: UpdateUserReq, _=Depends(require_admin
     db = get_db()
     try:
         fields, vals = [], []
-        if req.email  is not None: fields.append("email=?");  vals.append(req.email)
-        if req.role   is not None: fields.append("role=?");   vals.append(req.role)
-        if req.banned is not None: fields.append("banned=?"); vals.append(int(req.banned))
+        if req.email    is not None: fields.append("email=?");    vals.append(req.email)
+        if req.role     is not None: fields.append("role=?");     vals.append(req.role)
+        if req.banned   is not None: fields.append("banned=?");   vals.append(int(req.banned))
+        if req.password is not None and req.password != "":
+            if len(req.password) < 4: raise HTTPException(400, "密码至少4位")
+            fields.append("pw_hash=?"); vals.append(hash_pw(req.password))
         if not fields: raise HTTPException(400, "无更新内容")
         vals.append(username)
         db.execute(f"UPDATE users SET {','.join(fields)} WHERE username=?", vals)
@@ -334,14 +361,17 @@ async def delete_forum_post(pid: int, user=Depends(get_current_user)):
 
 # ── Admin: 云盘文件列表 & 删除 ────────────────────────────────────────────────
 @app.get("/admin/cloud/files")
-async def admin_list_cloud(username: str = "", _=Depends(require_admin)):
+async def admin_list_cloud(username: str = "", page: int = 1, _=Depends(require_admin)):
     db = get_db()
     try:
+        per = 30
         like = f"%{username}%"
+        total = db.execute("SELECT COUNT(*) FROM cloud_files WHERE owner LIKE ?", (like,)).fetchone()[0]
         rows = db.execute(
-            "SELECT id,owner,filename,size,created_at FROM cloud_files WHERE owner LIKE ? ORDER BY id DESC LIMIT 200",
-            (like,)).fetchall()
-        return {"files": [dict(r) for r in rows]}
+            "SELECT id,owner,filename,size,created_at FROM cloud_files WHERE owner LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (like, per, (page-1)*per)).fetchall()
+        pages = max(1, (total + per - 1) // per)
+        return {"files": [dict(r) for r in rows], "total": total, "page": page, "pages": pages}
     finally:
         db.close()
 
@@ -377,15 +407,22 @@ async def get_logs(page: int = 1, username: str = "", _=Depends(require_admin)):
 async def stats(_=Depends(require_admin)):
     db = get_db()
     try:
-        total   = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        banned  = db.execute("SELECT COUNT(*) FROM users WHERE banned=1").fetchone()[0]
-        admins  = db.execute("SELECT COUNT(*) FROM users WHERE role='admin'").fetchone()[0]
-        day_ago = int(time.time()) - 86400
-        active  = db.execute("SELECT COUNT(*) FROM users WHERE last_login>?", (day_ago,)).fetchone()[0]
+        total        = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        banned       = db.execute("SELECT COUNT(*) FROM users WHERE banned=1").fetchone()[0]
+        admins       = db.execute("SELECT COUNT(*) FROM users WHERE role='admin'").fetchone()[0]
+        day_ago      = int(time.time()) - 86400
+        active       = db.execute("SELECT COUNT(*) FROM users WHERE last_login>?", (day_ago,)).fetchone()[0]
         logins_today = db.execute("SELECT COUNT(*) FROM login_logs WHERE ts>? AND success=1", (day_ago,)).fetchone()[0]
         fails_today  = db.execute("SELECT COUNT(*) FROM login_logs WHERE ts>? AND success=0", (day_ago,)).fetchone()[0]
-        return {"total": total, "banned": banned, "admins": admins,
-                "active_24h": active, "logins_today": logins_today, "fails_today": fails_today}
+        chat_count   = db.execute("SELECT COUNT(*) FROM chat_messages").fetchone()[0]
+        forum_posts  = db.execute("SELECT COUNT(*) FROM forum_posts").fetchone()[0]
+        forum_cmts   = db.execute("SELECT COUNT(*) FROM forum_comments").fetchone()[0]
+        cloud_files  = db.execute("SELECT COUNT(*) FROM cloud_files").fetchone()[0]
+        cloud_bytes  = db.execute("SELECT COALESCE(SUM(size),0) FROM cloud_files").fetchone()[0]
+        return {"total_users": total, "banned_count": banned, "admins": admins,
+                "active_24h": active, "today_logins": logins_today, "today_fails": fails_today,
+                "chat_count": chat_count, "forum_posts": forum_posts, "forum_comments": forum_cmts,
+                "cloud_files": cloud_files, "cloud_bytes": cloud_bytes}
     finally:
         db.close()
 
@@ -694,585 +731,674 @@ ADMIN_HTML = r"""<!DOCTYPE html>
 <title>File Manager Pro — 管理后台</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh;font-size:14px}
+a{color:#7c83ff;text-decoration:none}
 .login-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh}
 .card{background:#1e2130;border:1px solid #2d3148;border-radius:16px;padding:32px;width:360px}
 h1{font-size:22px;margin-bottom:4px;color:#fff}
-.sub{color:#64748b;font-size:13px;margin-bottom:24px}
-label{display:block;font-size:12px;color:#94a3b8;margin-bottom:4px;margin-top:14px}
-input{width:100%;padding:10px 14px;background:#0f1117;border:1px solid #2d3148;border-radius:8px;color:#e2e8f0;font-size:14px;outline:none}
-input:focus{border-color:#6366f1}
-.btn{display:block;width:100%;padding:11px;background:#6366f1;color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer;margin-top:20px;font-weight:600}
-.btn:hover{background:#4f46e5}
-.err{color:#f87171;font-size:12px;margin-top:8px;min-height:16px}
-/* dashboard */
-#app{display:none;min-height:100vh}
-.topbar{background:#1e2130;border-bottom:1px solid #2d3148;padding:0 24px;height:56px;display:flex;align-items:center;gap:16px}
-.topbar h2{font-size:16px;color:#fff;flex:1}
-.topbar .logout{font-size:12px;color:#94a3b8;cursor:pointer;padding:6px 12px;border:1px solid #2d3148;border-radius:6px}
-.topbar .logout:hover{color:#f87171;border-color:#f87171}
-.layout{display:flex;min-height:calc(100vh - 56px)}
-.sidebar{width:200px;background:#1e2130;border-right:1px solid #2d3148;padding:16px 0}
-.nav-item{padding:10px 20px;font-size:13px;cursor:pointer;color:#94a3b8;display:flex;align-items:center;gap:8px}
-.nav-item:hover,.nav-item.active{background:#2d3148;color:#fff}
-.content{flex:1;padding:24px;overflow:auto}
-.stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:14px;margin-bottom:24px}
-.stat{background:#1e2130;border:1px solid #2d3148;border-radius:12px;padding:18px}
-.stat .num{font-size:28px;font-weight:700;color:#6366f1}
-.stat .lbl{font-size:12px;color:#64748b;margin-top:4px}
-.toolbar{display:flex;gap:10px;margin-bottom:16px;align-items:center;flex-wrap:wrap}
-.search{flex:1;min-width:180px;padding:8px 12px;background:#0f1117;border:1px solid #2d3148;border-radius:8px;color:#e2e8f0;font-size:13px;outline:none}
-.search:focus{border-color:#6366f1}
-.sm-btn{padding:7px 14px;background:#2d3148;border:none;border-radius:7px;color:#e2e8f0;font-size:12px;cursor:pointer}
-.sm-btn:hover{background:#3d4160}
-.sm-btn.danger{background:#7f1d1d;color:#fca5a5}
-.sm-btn.danger:hover{background:#991b1b}
-.sm-btn.primary{background:#6366f1;color:#fff}
-.sm-btn.primary:hover{background:#4f46e5}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{text-align:left;padding:10px 12px;border-bottom:1px solid #2d3148;color:#64748b;font-weight:500}
-td{padding:9px 12px;border-bottom:1px solid #1a1f2e;vertical-align:middle}
-tr:hover td{background:#1a1f2e}
-.badge{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600}
-.badge.admin{background:#312e81;color:#a5b4fc}
-.badge.user{background:#1e3a5f;color:#93c5fd}
-.badge.banned{background:#7f1d1d;color:#fca5a5}
-.page-row{display:flex;gap:8px;align-items:center;margin-top:16px;justify-content:flex-end}
-.page-btn{padding:5px 12px;background:#2d3148;border:none;border-radius:6px;color:#e2e8f0;cursor:pointer;font-size:12px}
-.page-btn:disabled{opacity:0.4;cursor:default}
-.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:999}
-.modal{background:#1e2130;border:1px solid #2d3148;border-radius:14px;padding:28px;width:340px}
-.modal h3{margin-bottom:16px;font-size:16px}
-.modal .btn-row{display:flex;gap:8px;margin-top:20px;justify-content:flex-end}
-.log-row{font-size:12px;padding:6px 0;border-bottom:1px solid #1a1f2e;display:flex;gap:12px;align-items:center}
-.log-row .ok{color:#4ade80}.log-row .fail{color:#f87171}
-.ts{color:#64748b;font-size:11px;min-width:140px}
-.ip-tag{background:#1a1f2e;border-radius:4px;padding:1px 6px;font-family:monospace;font-size:11px}
+h2{font-size:17px;color:#c8ccff;margin-bottom:12px}
+h3{font-size:14px;color:#a0aec0;margin-bottom:8px}
+input,select,textarea{width:100%;padding:10px 14px;background:#252840;border:1px solid #2d3148;border-radius:8px;color:#e2e8f0;font-size:14px;outline:none;transition:.2s}
+input:focus,select:focus,textarea:focus{border-color:#7c83ff}
+button{cursor:pointer;border:none;border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;transition:.15s}
+.btn-primary{background:#5a60e8;color:#fff}.btn-primary:hover{background:#6e74f0}
+.btn-danger{background:#e05252;color:#fff}.btn-danger:hover{background:#f06060}
+.btn-secondary{background:#2d3148;color:#c8ccff}.btn-secondary:hover{background:#363c5a}
+.btn-sm{padding:4px 10px;font-size:12px;border-radius:6px}
+.btn-success{background:#3a7d44;color:#fff}.btn-success:hover{background:#4a9d57}
+/* Layout */
+#app{display:none;min-height:100vh;flex-direction:column}
+.topbar{background:#1e2130;border-bottom:1px solid #2d3148;padding:0 24px;height:56px;display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:100}
+.topbar h1{font-size:16px;color:#fff;flex:1}
+.topbar .badge{background:#5a60e8;color:#fff;border-radius:20px;padding:2px 10px;font-size:12px}
+.layout{display:flex;flex:1}
+.sidebar{width:200px;background:#161824;border-right:1px solid #2d3148;padding:12px 0;flex-shrink:0;position:sticky;top:56px;height:calc(100vh - 56px);overflow-y:auto}
+.sidebar a{display:flex;align-items:center;gap:10px;padding:10px 20px;color:#a0aec0;font-size:14px;border-radius:0;transition:.15s;text-decoration:none}
+.sidebar a:hover{background:#1e2130;color:#e2e8f0}
+.sidebar a.active{background:#252840;color:#7c83ff;border-right:3px solid #7c83ff}
+.sidebar .section-title{padding:16px 20px 6px;font-size:11px;color:#4a5568;text-transform:uppercase;letter-spacing:.06em}
+.main{flex:1;padding:24px;overflow:auto;max-width:1200px}
+/* Cards */
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:16px;margin-bottom:24px}
+.stat-card{background:#1e2130;border:1px solid #2d3148;border-radius:12px;padding:20px}
+.stat-card .val{font-size:32px;font-weight:700;color:#7c83ff}
+.stat-card .lbl{font-size:12px;color:#a0aec0;margin-top:4px}
+.panel{background:#1e2130;border:1px solid #2d3148;border-radius:12px;padding:20px;margin-bottom:20px}
+/* Table */
+.tbl-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse}
+th{background:#161824;color:#a0aec0;font-size:12px;text-transform:uppercase;letter-spacing:.04em;padding:10px 12px;text-align:left;white-space:nowrap}
+td{padding:10px 12px;border-bottom:1px solid #252840;vertical-align:middle;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+tr:hover td{background:#252840}
+/* Toolbar */
+.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
+.toolbar input,.toolbar select{width:auto;flex:1;min-width:140px;max-width:280px}
+/* Avatar */
+.av{width:32px;height:32px;border-radius:50%;background:#5a60e8;display:inline-flex;align-items:center;justify-content:center;font-size:13px;color:#fff;font-weight:700;flex-shrink:0;overflow:hidden}
+.av img{width:100%;height:100%;object-fit:cover;border-radius:50%}
+/* Tags */
+.tag{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600}
+.tag-admin{background:#3a3a8a;color:#9090ff}
+.tag-user{background:#253040;color:#7ab4d8}
+.tag-banned{background:#4a2020;color:#f08080}
+.tag-pinned{background:#3a4a20;color:#aadd70}
+/* Modal */
+.modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;align-items:center;justify-content:center}
+.modal-bg.open{display:flex}
+.modal{background:#1e2130;border:1px solid #2d3148;border-radius:16px;padding:28px;width:min(480px,95vw);max-height:85vh;overflow-y:auto}
+.modal h2{margin-bottom:16px}
+.modal .row{margin-bottom:12px}
+.modal label{display:block;font-size:12px;color:#a0aec0;margin-bottom:4px}
+.modal-footer{display:flex;gap:10px;justify-content:flex-end;margin-top:20px}
+/* Pagination */
+.pagination{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}
+.pagination button{background:#252840;color:#c8ccff;border-radius:6px;padding:5px 12px;font-size:13px;border:1px solid #2d3148;cursor:pointer}
+.pagination button.active{background:#5a60e8;color:#fff;border-color:#5a60e8}
+.pagination button:disabled{opacity:.4;cursor:default}
+/* Forum post detail */
+.post-content{background:#161824;border-radius:8px;padding:14px;line-height:1.6;margin:10px 0;white-space:pre-wrap;word-break:break-word}
+/* Tabs */
+.tabs{display:flex;gap:2px;margin-bottom:20px;background:#161824;border-radius:10px;padding:4px}
+.tab-btn{flex:1;padding:8px;background:none;border:none;color:#a0aec0;font-size:13px;border-radius:7px;cursor:pointer;transition:.15s}
+.tab-btn.active{background:#252840;color:#c8ccff}
+/* Toast */
+#toast{position:fixed;bottom:20px;right:20px;background:#2d3148;color:#e2e8f0;padding:10px 18px;border-radius:10px;font-size:13px;z-index:999;display:none}
 </style>
 </head>
 <body>
 
-<!-- 登录 -->
-<div class="login-wrap" id="loginWrap">
-  <div class="card">
-    <h1>🔐 管理后台</h1>
-    <p class="sub">File Manager Pro</p>
-    <label>管理员密码</label>
-    <input type="password" id="adminPw" placeholder="输入管理员密码" onkeydown="if(event.key==='Enter')doLogin()">
-    <button class="btn" onclick="doLogin()">登 录</button>
-    <div class="err" id="loginErr"></div>
-  </div>
+<!-- LOGIN -->
+<div class="login-wrap" id="loginView">
+<div class="card">
+  <h1>🛡 管理后台</h1>
+  <p style="color:#a0aec0;font-size:13px;margin-bottom:20px">File Manager Pro</p>
+  <div style="margin-bottom:12px"><input type="password" id="adminPw" placeholder="管理员密码" onkeydown="if(event.key==='Enter')doLogin()"></div>
+  <button class="btn-primary" style="width:100%;padding:12px" onclick="doLogin()">登 录</button>
+  <div id="loginErr" style="color:#f08080;font-size:13px;margin-top:10px;text-align:center"></div>
+</div>
 </div>
 
-<!-- 主界面 -->
-<div id="app">
-  <div class="topbar">
-    <h2>📊 File Manager Pro — 管理后台</h2>
-    <span class="logout" onclick="logout()">退出登录</span>
+<!-- APP -->
+<div id="app" style="display:none;flex-direction:column">
+<div class="topbar">
+  <h1>🛡 File Manager Pro 管理后台</h1>
+  <span class="badge" id="adminBadge">管理员</span>
+  <button class="btn-secondary btn-sm" onclick="doLogout()">退出</button>
+</div>
+<div class="layout">
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="section-title">概览</div>
+    <a href="#" onclick="showTab('overview')" id="nav-overview" class="active">📊 数据概览</a>
+    <div class="section-title">用户</div>
+    <a href="#" onclick="showTab('users')" id="nav-users">👥 用户管理</a>
+    <a href="#" onclick="showTab('logs')" id="nav-logs">📋 登录日志</a>
+    <div class="section-title">内容</div>
+    <a href="#" onclick="showTab('announce')" id="nav-announce">📢 公告管理</a>
+    <a href="#" onclick="showTab('chat')" id="nav-chat">💬 聊天记录</a>
+    <a href="#" onclick="showTab('forum')" id="nav-forum">🗣 论坛管理</a>
+    <div class="section-title">存储</div>
+    <a href="#" onclick="showTab('cloud')" id="nav-cloud">☁️ 云盘管理</a>
   </div>
-  <div class="layout">
-    <div class="sidebar">
-      <div class="nav-item active" id="nav-overview" onclick="showTab('overview')">📊 概览</div>
-      <div class="nav-item" id="nav-users"    onclick="showTab('users')">👥 用户管理</div>
-      <div class="nav-item" id="nav-logs"     onclick="showTab('logs')">📋 登录日志</div>
-      <div class="nav-item" id="nav-announce" onclick="showTab('announce')">📢 公告管理</div>
-      <div class="nav-item" id="nav-chat"     onclick="showTab('chat')">💬 聊天记录</div>
-      <div class="nav-item" id="nav-forum"    onclick="showTab('forum')">🗣 论坛管理</div>
-      <div class="nav-item" id="nav-cloud"    onclick="showTab('cloud')">☁️ 云盘管理</div>
-    </div>
-    <div class="content">
 
-      <!-- 概览 -->
-      <div id="tab-overview">
-        <div class="stats-grid" id="statsGrid"></div>
-        <div style="color:#64748b;font-size:13px">最近注册用户</div>
-        <table style="margin-top:12px"><thead><tr>
-          <th>用户名</th><th>邮箱</th><th>角色</th><th>注册时间</th><th>最后登录</th>
-        </tr></thead><tbody id="recentUsers"></tbody></table>
+  <!-- Main content -->
+  <div class="main" id="mainContent">
+    <!-- OVERVIEW -->
+    <div id="tab-overview">
+      <div class="stats-grid" id="statsGrid"></div>
+      <div class="panel">
+        <h2>📈 最近注册用户</h2>
+        <div class="tbl-wrap"><table id="recentUsersTable">
+          <thead><tr><th>用户名</th><th>邮箱</th><th>注册时间</th><th>登录次数</th><th>角色</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
       </div>
+    </div>
 
-      <!-- 用户管理 -->
-      <div id="tab-users" style="display:none">
+    <!-- USERS -->
+    <div id="tab-users" style="display:none">
+      <div class="panel">
+        <h2>👥 用户管理</h2>
         <div class="toolbar">
-          <input class="search" placeholder="搜索用户名/邮箱…" id="userSearch" oninput="debounceSearch()">
-          <button class="sm-btn primary" onclick="openAddModal()">+ 添加用户</button>
+          <input id="userSearch" placeholder="搜索用户名..." oninput="loadUsers(1)">
+          <button class="btn-primary" onclick="showCreateUser()">＋ 新建用户</button>
         </div>
-        <table><thead><tr>
-          <th>ID</th><th>用户名</th><th>邮箱</th><th>角色</th><th>状态</th>
-          <th>登录次数</th><th>最后登录</th><th>最后IP</th><th>操作</th>
-        </tr></thead><tbody id="usersBody"></tbody></table>
-        <div class="page-row">
-          <button class="page-btn" id="prevBtn" onclick="changePage(-1)">← 上页</button>
-          <span id="pageInfo" style="font-size:12px;color:#64748b"></span>
-          <button class="page-btn" id="nextBtn" onclick="changePage(1)">下页 →</button>
-        </div>
+        <div class="tbl-wrap"><table><thead><tr>
+          <th>头像</th><th>用户名</th><th>邮箱</th><th>角色</th><th>登录次数</th><th>最后登录</th><th>最后IP</th><th>状态</th><th>操作</th>
+        </tr></thead><tbody id="usersTbody"></tbody></table></div>
+        <div class="pagination" id="usersPagination"></div>
       </div>
+    </div>
 
-      <!-- 登录日志 -->
-      <div id="tab-logs" style="display:none">
+    <!-- LOGS -->
+    <div id="tab-logs" style="display:none">
+      <div class="panel">
+        <h2>📋 登录日志</h2>
         <div class="toolbar">
-          <input class="search" placeholder="按用户名筛选…" id="logSearch" oninput="loadLogs()">
+          <input id="logSearch" placeholder="搜索用户名..." oninput="loadLogs(1)">
         </div>
-        <div id="logsBody"></div>
-        <div class="page-row">
-          <button class="page-btn" id="logPrev" onclick="changeLogPage(-1)">← 上页</button>
-          <span id="logPageInfo" style="font-size:12px;color:#64748b"></span>
-          <button class="page-btn" id="logNext" onclick="changeLogPage(1)">下页 →</button>
-        </div>
+        <div class="tbl-wrap"><table><thead><tr>
+          <th>用户名</th><th>时间</th><th>IP</th><th>设备</th><th>结果</th>
+        </tr></thead><tbody id="logsTbody"></tbody></table></div>
+        <div class="pagination" id="logsPagination"></div>
       </div>
+    </div>
 
-      <!-- 公告管理 -->
-      <div id="tab-announce" style="display:none">
+    <!-- ANNOUNCE -->
+    <div id="tab-announce" style="display:none">
+      <div class="panel">
+        <h2>📢 公告管理</h2>
+        <button class="btn-primary" style="margin-bottom:14px" onclick="showAnnounceModal()">＋ 发布公告</button>
+        <div id="announceList"></div>
+      </div>
+    </div>
+
+    <!-- CHAT -->
+    <div id="tab-chat" style="display:none">
+      <div class="panel">
+        <h2>💬 聊天记录</h2>
         <div class="toolbar">
-          <button class="sm-btn primary" onclick="openAnnounceModal()">+ 发布公告</button>
+          <input id="chatUserSearch" placeholder="筛选用户名..." oninput="loadChat()">
+          <button class="btn-secondary btn-sm" onclick="loadChat()">刷新</button>
         </div>
-        <div id="announceBody"></div>
+        <div id="chatList" style="display:flex;flex-direction:column;gap:8px"></div>
       </div>
+    </div>
 
-      <!-- 聊天记录 -->
-      <div id="tab-chat" style="display:none">
+    <!-- FORUM -->
+    <div id="tab-forum" style="display:none">
+      <div id="forumList">
+        <div class="panel">
+          <h2>🗣 论坛帖子</h2>
+          <div class="toolbar">
+            <button class="btn-secondary btn-sm" onclick="loadForum(1)">刷新</button>
+          </div>
+          <div class="tbl-wrap"><table><thead><tr>
+            <th>ID</th><th>标题</th><th>作者</th><th>回复</th><th>时间</th><th>操作</th>
+          </tr></thead><tbody id="forumTbody"></tbody></table></div>
+          <div class="pagination" id="forumPagination"></div>
+        </div>
+      </div>
+      <div id="forumDetail" style="display:none"></div>
+    </div>
+
+    <!-- CLOUD -->
+    <div id="tab-cloud" style="display:none">
+      <div class="panel">
+        <h2>☁️ 云盘文件管理</h2>
         <div class="toolbar">
-          <input class="search" placeholder="按用户名筛选…" id="chatSearch" oninput="loadChat()">
-          <button class="sm-btn" onclick="loadChat()">刷新</button>
+          <input id="cloudUserSearch" placeholder="筛选用户名..." oninput="loadCloud(1)">
+          <button class="btn-secondary btn-sm" onclick="loadCloud(1)">刷新</button>
         </div>
-        <div id="chatBody"></div>
+        <div class="tbl-wrap"><table><thead><tr>
+          <th>用户</th><th>文件名</th><th>大小</th><th>上传时间</th><th>操作</th>
+        </tr></thead><tbody id="cloudTbody"></tbody></table></div>
+        <div class="pagination" id="cloudPagination"></div>
+        <div id="cloudStats" style="margin-top:12px;color:#a0aec0;font-size:12px"></div>
       </div>
-
-      <!-- 论坛管理 -->
-      <div id="tab-forum" style="display:none">
-        <div id="forumBody"></div>
-        <div class="page-row">
-          <button class="page-btn" id="forumPrev" onclick="changeForumPage(-1)">← 上页</button>
-          <span id="forumPageInfo" style="font-size:12px;color:#64748b"></span>
-          <button class="page-btn" id="forumNext" onclick="changeForumPage(1)">下页 →</button>
-        </div>
-      </div>
-
-      <!-- 云盘管理 -->
-      <div id="tab-cloud" style="display:none">
-        <div class="toolbar">
-          <input class="search" placeholder="按用户名筛选…" id="cloudSearch" oninput="loadCloud()">
-        </div>
-        <div id="cloudBody"></div>
-      </div>
-
     </div>
   </div>
 </div>
-
-<!-- 编辑用户 modal -->
-<div class="modal-bg" id="editModal" style="display:none" onclick="if(event.target===this)this.style.display='none'">
-  <div class="modal">
-    <h3>编辑用户：<span id="editUsername"></span></h3>
-    <label>邮箱</label><input id="editEmail" placeholder="email">
-    <label>角色</label>
-    <select id="editRole" style="width:100%;padding:9px;background:#0f1117;border:1px solid #2d3148;border-radius:8px;color:#e2e8f0;margin-top:4px">
-      <option value="user">user</option><option value="admin">admin</option>
-    </select>
-    <label style="display:flex;align-items:center;gap:8px;margin-top:14px;cursor:pointer">
-      <input type="checkbox" id="editBanned"> 封禁账户
-    </label>
-    <div class="btn-row">
-      <button class="sm-btn" onclick="document.getElementById('editModal').style.display='none'">取消</button>
-      <button class="sm-btn primary" onclick="saveEdit()">保存</button>
-    </div>
-  </div>
 </div>
 
-<!-- 添加用户 modal -->
-<div class="modal-bg" id="addModal" style="display:none" onclick="if(event.target===this)this.style.display='none'">
-  <div class="modal">
-    <h3>添加用户</h3>
-    <label>用户名</label><input id="addUser" placeholder="至少2个字符">
-    <label>密码</label><input id="addPw" type="password" placeholder="至少4个字符">
-    <label>邮箱（可选）</label><input id="addEmail" placeholder="email">
-    <div class="err" id="addErr"></div>
-    <div class="btn-row">
-      <button class="sm-btn" onclick="document.getElementById('addModal').style.display='none'">取消</button>
-      <button class="sm-btn primary" onclick="doAddUser()">创建</button>
-    </div>
+<!-- Modals -->
+<div class="modal-bg" id="userModal">
+<div class="modal">
+  <h2 id="userModalTitle">编辑用户</h2>
+  <input type="hidden" id="editUsername">
+  <div class="row"><label>邮箱</label><input id="editEmail" placeholder="邮箱（可选）"></div>
+  <div class="row"><label>角色</label><select id="editRole"><option value="user">普通用户</option><option value="admin">管理员</option></select></div>
+  <div class="row"><label>新密码（留空不改）</label><input type="password" id="editPassword" placeholder="新密码"></div>
+  <div class="row" id="banRow"><label>封禁</label><select id="editBanned"><option value="0">正常</option><option value="1">封禁</option></select></div>
+  <div id="userModalErr" style="color:#f08080;font-size:13px;margin-bottom:8px"></div>
+  <div class="modal-footer">
+    <button class="btn-secondary" onclick="closeModal('userModal')">取消</button>
+    <button class="btn-primary" onclick="saveUser()">保存</button>
   </div>
+</div>
 </div>
 
-<!-- 设备信息 modal -->
-<div class="modal-bg" id="deviceModal" style="display:none" onclick="if(event.target===this)this.style.display='none'">
-  <div class="modal" style="width:380px">
-    <h3>📱 设备信息：<span id="deviceUsername"></span></h3>
-    <div id="deviceBody" style="margin-top:12px;font-size:13px;line-height:2"></div>
-    <div class="btn-row" style="margin-top:16px">
-      <button class="sm-btn" onclick="document.getElementById('deviceModal').style.display='none'">关闭</button>
-    </div>
+<div class="modal-bg" id="createUserModal">
+<div class="modal">
+  <h2>＋ 新建用户</h2>
+  <div class="row"><label>用户名</label><input id="newUsername" placeholder="用户名"></div>
+  <div class="row"><label>密码</label><input type="password" id="newPassword" placeholder="密码"></div>
+  <div class="row"><label>邮箱（可选）</label><input id="newEmail" placeholder="邮箱"></div>
+  <div class="row"><label>角色</label><select id="newRole"><option value="user">普通用户</option><option value="admin">管理员</option></select></div>
+  <div id="createUserErr" style="color:#f08080;font-size:13px;margin-bottom:8px"></div>
+  <div class="modal-footer">
+    <button class="btn-secondary" onclick="closeModal('createUserModal')">取消</button>
+    <button class="btn-primary" onclick="doCreateUser()">创建</button>
   </div>
+</div>
 </div>
 
-<!-- 发布公告 modal -->
-<div class="modal-bg" id="announceModal" style="display:none" onclick="if(event.target===this)this.style.display='none'">
-  <div class="modal">
-    <h3>📢 发布公告</h3>
-    <label>标题</label><input id="ann-title" placeholder="公告标题">
-    <label>内容</label><textarea id="ann-content" placeholder="公告内容…" style="width:100%;height:100px;padding:9px;background:#0f1117;border:1px solid #2d3148;border-radius:8px;color:#e2e8f0;margin-top:4px;resize:vertical"></textarea>
-    <label style="display:flex;align-items:center;gap:8px;margin-top:12px;cursor:pointer">
-      <input type="checkbox" id="ann-pinned"> 置顶公告
-    </label>
-    <div class="err" id="ann-err"></div>
-    <div class="btn-row">
-      <button class="sm-btn" onclick="document.getElementById('announceModal').style.display='none'">取消</button>
-      <button class="sm-btn primary" onclick="doPostAnnounce()">发布</button>
-    </div>
+<div class="modal-bg" id="announceModal">
+<div class="modal">
+  <h2>📢 发布公告</h2>
+  <div class="row"><label>标题</label><input id="annTitle" placeholder="公告标题"></div>
+  <div class="row"><label>内容</label><textarea id="annContent" rows="4" placeholder="公告内容"></textarea></div>
+  <div class="row"><label><input type="checkbox" id="annPinned" style="width:auto;margin-right:6px">置顶</label></div>
+  <div class="modal-footer">
+    <button class="btn-secondary" onclick="closeModal('announceModal')">取消</button>
+    <button class="btn-primary" onclick="postAnnounce()">发布</button>
   </div>
 </div>
+</div>
+
+<div id="toast"></div>
 
 <script>
-let TOKEN = '', curPage = 1, logPage = 1, curTab = 'overview', editingUser = '';
-let searchTimer = null;
+let token = '';
+const BASE = '';
 
 async function api(method, path, body) {
-  const r = await fetch(path, {
-    method, headers: {'Content-Type':'application/json', 'Authorization': TOKEN ? `Bearer ${TOKEN}` : ''},
-    body: body ? JSON.stringify(body) : undefined
-  });
-  const d = await r.json().catch(()=>({}));
-  if (!r.ok) throw new Error(d.detail || d.message || r.status);
-  return d;
+  const opts = { method, headers: {'Content-Type':'application/json'} };
+  if (token) opts.headers['Authorization'] = 'Bearer ' + token;
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  const r = await fetch(BASE + path, opts);
+  let data; try { data = await r.json(); } catch { data = {}; }
+  if (!r.ok) throw new Error(data.detail || r.statusText);
+  return data;
+}
+
+function toast(msg, err=false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.style.background = err ? '#6a2020' : '#2d3148';
+  t.style.display = 'block'; setTimeout(() => t.style.display='none', 2500);
 }
 
 async function doLogin() {
   const pw = document.getElementById('adminPw').value;
   try {
     const d = await api('POST', '/admin/login', {password: pw});
-    TOKEN = d.token;
-    document.getElementById('loginWrap').style.display = 'none';
-    document.getElementById('app').style.display = 'block';
+    token = d.token;
+    document.getElementById('loginView').style.display = 'none';
+    document.getElementById('app').style.display = 'flex';
     showTab('overview');
-  } catch(e) {
-    document.getElementById('loginErr').textContent = e.message;
-  }
+  } catch(e) { document.getElementById('loginErr').textContent = '❌ ' + e.message; }
 }
 
-function logout() {
-  TOKEN = ''; location.reload();
-}
+function doLogout() { token=''; location.reload(); }
 
-function showTab(tab) {
-  curTab = tab;
-  ['overview','users','logs','announce','chat','forum','cloud'].forEach(t => {
-    document.getElementById('tab-'+t).style.display = t===tab ? '' : 'none';
-    document.getElementById('nav-'+t).classList.toggle('active', t===tab);
+const TABS = ['overview','users','logs','announce','chat','forum','cloud'];
+function showTab(name) {
+  TABS.forEach(t => {
+    document.getElementById('tab-'+t).style.display = t===name ? 'block' : 'none';
+    const n = document.getElementById('nav-'+t);
+    if (n) n.classList.toggle('active', t===name);
   });
-  if (tab==='overview') loadOverview();
-  if (tab==='users')    { curPage=1; loadUsers(); }
-  if (tab==='logs')     { logPage=1; loadLogs(); }
-  if (tab==='announce') loadAnnouncements();
-  if (tab==='chat')     loadChat();
-  if (tab==='forum')    { forumPage=1; loadForum(); }
-  if (tab==='cloud')    loadCloud();
+  if (name==='overview') loadOverview();
+  else if (name==='users') loadUsers(1);
+  else if (name==='logs') loadLogs(1);
+  else if (name==='announce') loadAnnounce();
+  else if (name==='chat') loadChat();
+  else if (name==='forum') loadForum(1);
+  else if (name==='cloud') loadCloud(1);
 }
 
-function fmtTime(ts) {
-  if (!ts) return '—';
-  return new Date(ts*1000).toLocaleString('zh-CN',{hour12:false});
-}
+function openModal(id) { document.getElementById(id).classList.add('open'); }
+function closeModal(id) { document.getElementById(id).classList.remove('open'); }
 
-function fmtDevice(raw) {
-  if (!raw) return '—';
-  try {
-    const d = JSON.parse(raw);
-    if (!d || Object.keys(d).length === 0) return '—';
-    return (d.model || d.os || '未知设备').substring(0, 24);
-  } catch(e) { return '—'; }
-}
-
-function showDevice(u) {
-  document.getElementById('deviceUsername').textContent = u.username;
-  let html = '';
-  try {
-    const d = u.device_info ? JSON.parse(u.device_info) : {};
-    const fmtBytes = b => b > 0 ? (b >= 1073741824 ? (b/1073741824).toFixed(1)+'GB' : (b/1048576).toFixed(0)+'MB') : '—';
-    const rows = [
-      ['操作系统',   d.os],
-      ['设备型号',   d.model],
-      ['CPU',       d.cpu],
-      ['CPU核心',   d.cpu_cores ? d.cpu_cores+'核' : null],
-      ['CPU架构',   d.cpu_arch],
-      ['内存',      fmtBytes(d.ram_total)],
-      ['可用存储',  fmtBytes(d.storage_free)],
-      ['本地IP',    d.local_ip],
-      ['语言区域',  d.locale],
-      ['引擎版本',  d.godot_ver ? 'Godot '+d.godot_ver : null],
-    ];
-    for (const [k, v] of rows) {
-      if (v && v !== '—') {
-        html += `<div style="display:flex;gap:8px;border-bottom:1px solid #1a1f2e;padding:4px 0">
-          <span style="color:#64748b;min-width:80px">${k}</span>
-          <span>${v}</span></div>`;
-      }
-    }
-    if (!html) html = '<span style="color:#64748b">暂无设备数据（旧版客户端）</span>';
-  } catch(e) {
-    html = '<span style="color:#64748b">数据解析失败</span>';
-  }
-  document.getElementById('deviceBody').innerHTML = html;
-  document.getElementById('deviceModal').style.display = 'flex';
-}
-
-// ── 概览 ──
+// ── OVERVIEW ──────────────────────────────────────────────────────────────────
 async function loadOverview() {
   try {
-    const s = await api('GET', '/admin/stats');
-    document.getElementById('statsGrid').innerHTML = [
-      ['总用户数', s.total, ''],
-      ['24h活跃', s.active_24h, ''],
-      ['今日登录', s.logins_today, ''],
-      ['今日失败', s.fails_today, ''],
-      ['管理员', s.admins, ''],
-      ['已封禁', s.banned, ''],
-    ].map(([l,n])=>`<div class="stat"><div class="num">${n}</div><div class="lbl">${l}</div></div>`).join('');
-    const d = await api('GET', '/admin/users?page=1');
-    document.getElementById('recentUsers').innerHTML = d.users.map(u=>`
-      <tr><td>${u.username}</td><td>${u.email||'—'}</td>
-      <td><span class="badge ${u.role}">${u.role}</span></td>
-      <td>${fmtTime(u.created_at)}</td><td>${fmtTime(u.last_login)}</td></tr>
-    `).join('');
-  } catch(e) { console.error(e); }
+    const d = await api('GET', '/admin/stats');
+    const sg = document.getElementById('statsGrid');
+    sg.innerHTML = [
+      ['👥 总用户', d.total_users],
+      ['✅ 今日登录', d.today_logins],
+      ['💬 聊天消息', d.chat_count || 0],
+      ['🗣 论坛帖子', d.forum_posts || 0],
+      ['💬 论坛回复', d.forum_comments || 0],
+      ['☁️ 云盘文件', d.cloud_files || 0],
+      ['📦 云盘用量', fmtSize(d.cloud_bytes || 0)],
+      ['🚫 封禁用户', d.banned_count || 0],
+    ].map(([l,v]) => `<div class="stat-card"><div class="val">${v}</div><div class="lbl">${l}</div></div>`).join('');
+    const ru = await api('GET', '/admin/users?page=1&q=');
+    const tbody = document.querySelector('#recentUsersTable tbody');
+    tbody.innerHTML = (ru.users || []).slice(0,8).map(u => `
+      <tr>
+        <td>${esc(u.username)}</td>
+        <td>${esc(u.email||'—')}</td>
+        <td>${fmtTs(u.created_at)}</td>
+        <td>${u.login_count}</td>
+        <td><span class="tag ${u.role==='admin'?'tag-admin':'tag-user'}">${u.role}</span></td>
+      </tr>`).join('');
+  } catch(e) { toast('加载失败: '+e.message, true); }
 }
 
-// ── 用户管理 ──
-async function loadUsers() {
+// ── USERS ─────────────────────────────────────────────────────────────────────
+let usersPage = 1;
+async function loadUsers(page=1) {
+  usersPage = page;
   const q = document.getElementById('userSearch').value;
   try {
-    const d = await api('GET', `/admin/users?page=${curPage}&q=${encodeURIComponent(q)}`);
-    const totalPages = Math.ceil(d.total / d.per) || 1;
-    document.getElementById('pageInfo').textContent = `第 ${curPage}/${totalPages} 页，共 ${d.total} 用户`;
-    document.getElementById('prevBtn').disabled = curPage <= 1;
-    document.getElementById('nextBtn').disabled = curPage >= totalPages;
-    document.getElementById('usersBody').innerHTML = d.users.map(u => `
-      <tr>
-        <td style="color:#64748b">${u.id}</td>
-        <td><b>${u.username}</b></td>
-        <td>${u.email||'—'}</td>
-        <td><span class="badge ${u.role}">${u.role}</span></td>
-        <td>${u.banned ? '<span class="badge banned">封禁</span>' : '<span style="color:#4ade80">正常</span>'}</td>
+    const d = await api('GET', `/admin/users?page=${page}&q=${encodeURIComponent(q)}`);
+    const tbody = document.getElementById('usersTbody');
+    tbody.innerHTML = (d.users||[]).map(u => {
+      const avHtml = u.avatar && u.avatar.length > 50
+        ? `<div class="av"><img src="data:image/png;base64,${u.avatar}" onerror="this.parentElement.textContent='${esc(u.username).charAt(0).toUpperCase()}'"></div>`
+        : `<div class="av">${esc(u.avatar||u.username.charAt(0).toUpperCase())}</div>`;
+      return `<tr>
+        <td>${avHtml}</td>
+        <td><strong>${esc(u.username)}</strong></td>
+        <td>${esc(u.email||'—')}</td>
+        <td><span class="tag ${u.role==='admin'?'tag-admin':'tag-user'}">${u.role}</span></td>
         <td>${u.login_count}</td>
-        <td>${fmtTime(u.last_login)}</td>
-        <td style="font-size:11px;max-width:140px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">
-          ${fmtDevice(u.device_info)}
-        </td>
-        <td><span class="ip-tag">${u.last_ip||'—'}</span></td>
+        <td>${fmtTs(u.last_login)}</td>
+        <td>${esc(u.last_ip||'—')}</td>
+        <td>${u.banned?'<span class="tag tag-banned">封禁</span>':'<span style="color:#48bb78;font-size:12px">正常</span>'}</td>
         <td style="white-space:nowrap">
-          <button class="sm-btn" onclick="openEdit(${JSON.stringify(u).replace(/"/g,'&quot;')})">编辑</button>
-          <button class="sm-btn" onclick="showDevice(${JSON.stringify(u).replace(/"/g,'&quot;')})">📱</button>
-          <button class="sm-btn danger" onclick="delUser('${u.username}')">删除</button>
+          <button class="btn-secondary btn-sm" onclick="editUser('${esc(u.username)}','${esc(u.email||'')}','${u.role}',${u.banned})">编辑</button>
+          <button class="btn-danger btn-sm" onclick="delUser('${esc(u.username)}')">删除</button>
         </td>
-      </tr>
-    `).join('');
-  } catch(e) { console.error(e); }
+      </tr>`;
+    }).join('');
+    renderPagination('usersPagination', d.page, d.pages, loadUsers);
+  } catch(e) { toast('加载失败: '+e.message, true); }
 }
 
-function debounceSearch() {
-  clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => { curPage=1; loadUsers(); }, 300);
+function editUser(uname, email, role, banned) {
+  document.getElementById('editUsername').value = uname;
+  document.getElementById('editEmail').value = email;
+  document.getElementById('editRole').value = role;
+  document.getElementById('editBanned').value = banned;
+  document.getElementById('editPassword').value = '';
+  document.getElementById('userModalTitle').textContent = '编辑用户 — ' + uname;
+  document.getElementById('userModalErr').textContent = '';
+  openModal('userModal');
 }
 
-function changePage(d) { curPage += d; loadUsers(); }
-
-function openEdit(u) {
-  editingUser = u.username;
-  document.getElementById('editUsername').textContent = u.username;
-  document.getElementById('editEmail').value = u.email||'';
-  document.getElementById('editRole').value  = u.role;
-  document.getElementById('editBanned').checked = !!u.banned;
-  document.getElementById('editModal').style.display = 'flex';
-}
-
-async function saveEdit() {
+async function saveUser() {
+  const uname = document.getElementById('editUsername').value;
+  const body = {
+    email: document.getElementById('editEmail').value || null,
+    role: document.getElementById('editRole').value,
+    banned: parseInt(document.getElementById('editBanned').value),
+  };
+  const pw = document.getElementById('editPassword').value;
+  if (pw) body.password = pw;
   try {
-    await api('PATCH', `/admin/users/${editingUser}`, {
-      email:  document.getElementById('editEmail').value,
-      role:   document.getElementById('editRole').value,
-      banned: document.getElementById('editBanned').checked
-    });
-    document.getElementById('editModal').style.display = 'none';
-    loadUsers();
-  } catch(e) { alert(e.message); }
+    await api('PATCH', `/admin/users/${encodeURIComponent(uname)}`, body);
+    toast('✅ 已更新'); closeModal('userModal'); loadUsers(usersPage);
+  } catch(e) { document.getElementById('userModalErr').textContent = '❌ '+e.message; }
 }
 
-async function delUser(username) {
-  if (!confirm(`确认删除用户 "${username}"？此操作不可撤销`)) return;
+async function delUser(uname) {
+  if (!confirm(`确认删除用户 ${uname}？此操作不可逆！`)) return;
+  try { await api('DELETE', `/admin/users/${encodeURIComponent(uname)}`); toast('已删除'); loadUsers(usersPage); }
+  catch(e) { toast(e.message, true); }
+}
+
+function showCreateUser() {
+  document.getElementById('newUsername').value='';
+  document.getElementById('newPassword').value='';
+  document.getElementById('newEmail').value='';
+  document.getElementById('newRole').value='user';
+  document.getElementById('createUserErr').textContent='';
+  openModal('createUserModal');
+}
+
+async function doCreateUser() {
+  const body = {
+    username: document.getElementById('newUsername').value.trim(),
+    password: document.getElementById('newPassword').value,
+    email: document.getElementById('newEmail').value.trim() || null,
+    role: document.getElementById('newRole').value,
+  };
+  if (!body.username || !body.password) { document.getElementById('createUserErr').textContent='⚠ 用户名和密码必填'; return; }
   try {
-    await api('DELETE', `/admin/users/${username}`);
-    loadUsers();
-  } catch(e) { alert(e.message); }
+    await api('POST', '/admin/users', body);
+    toast('✅ 用户已创建'); closeModal('createUserModal'); loadUsers(1);
+  } catch(e) { document.getElementById('createUserErr').textContent = '❌ '+e.message; }
 }
 
-function openAddModal() {
-  ['addUser','addPw','addEmail'].forEach(id => document.getElementById(id).value='');
-  document.getElementById('addErr').textContent='';
-  document.getElementById('addModal').style.display='flex';
-}
-
-async function doAddUser() {
-  const u = document.getElementById('addUser').value.trim();
-  const p = document.getElementById('addPw').value;
-  const e = document.getElementById('addEmail').value.trim();
-  try {
-    await api('POST', '/auth/register', {username:u, password:p, email:e});
-    document.getElementById('addModal').style.display='none';
-    loadUsers();
-  } catch(err) {
-    document.getElementById('addErr').textContent = err.message;
-  }
-}
-
-// ── 登录日志 ──
-async function loadLogs() {
+// ── LOGS ──────────────────────────────────────────────────────────────────────
+let logsPage = 1;
+async function loadLogs(page=1) {
+  logsPage = page;
   const q = document.getElementById('logSearch').value;
   try {
-    const d = await api('GET', `/admin/logs?page=${logPage}&username=${encodeURIComponent(q)}`);
-    const totalPages = Math.ceil(d.total / 50) || 1;
-    document.getElementById('logPageInfo').textContent = `第 ${logPage}/${totalPages} 页，共 ${d.total} 条`;
-    document.getElementById('logPrev').disabled = logPage <= 1;
-    document.getElementById('logNext').disabled = logPage >= totalPages;
-    document.getElementById('logsBody').innerHTML = d.logs.map(l => `
-      <div class="log-row">
-        <span class="ts">${fmtTime(l.ts)}</span>
-        <span class="${l.success?'ok':'fail'}">${l.success?'✅ 成功':'❌ 失败'}</span>
-        <b>${l.username}</b>
-        <span class="ip-tag">${l.ip||'—'}</span>
-      </div>
-    `).join('') || '<div style="color:#64748b;padding:16px 0">暂无日志</div>';
-  } catch(e) { console.error(e); }
+    const d = await api('GET', `/admin/logs?page=${page}&username=${encodeURIComponent(q)}`);
+    const tbody = document.getElementById('logsTbody');
+    tbody.innerHTML = (d.logs||[]).map(l => `<tr>
+      <td>${esc(l.username)}</td>
+      <td>${fmtTs(l.ts)}</td>
+      <td>${esc(l.ip||'—')}</td>
+      <td style="max-width:200px">${esc(l.device||'—')}</td>
+      <td>${l.success?'<span style="color:#48bb78">✓ 成功</span>':'<span style="color:#f08080">✗ 失败</span>'}</td>
+    </tr>`).join('');
+    renderPagination('logsPagination', d.page, d.pages, loadLogs);
+  } catch(e) { toast('加载失败: '+e.message, true); }
 }
 
-function changeLogPage(d) { logPage += d; loadLogs(); }
-
-// ── 公告管理 ──────────────────────────────────────────────────────────────────
-async function loadAnnouncements() {
+// ── ANNOUNCE ──────────────────────────────────────────────────────────────────
+async function loadAnnounce() {
   try {
     const d = await api('GET', '/api/announcements');
-    const body = document.getElementById('announceBody');
-    if (!d.items.length) { body.innerHTML = '<p style="color:#64748b">暂无公告</p>'; return; }
-    body.innerHTML = '<table><thead><tr><th>ID</th><th>标题</th><th>内容</th><th>作者</th><th>置顶</th><th>时间</th><th>操作</th></tr></thead><tbody>' +
-      d.items.map(a => `<tr>
-        <td>${a.id}</td>
-        <td><b>${esc(a.title)}</b></td>
-        <td style="max-width:300px;word-break:break-all">${esc(a.content)}</td>
-        <td>${esc(a.author)}</td>
-        <td>${a.pinned ? '📌' : '—'}</td>
-        <td>${fmtTime(a.created_at)}</td>
-        <td><button class="sm-btn danger" onclick="delAnnounce(${a.id})">删除</button></td>
-      </tr>`).join('') + '</tbody></table>';
-  } catch(e) { document.getElementById('announceBody').innerHTML = `<p style="color:#ef4444">${e.message}</p>`; }
+    const el = document.getElementById('announceList');
+    if (!d.items || d.items.length===0) { el.innerHTML='<p style="color:#a0aec0">暂无公告</p>'; return; }
+    el.innerHTML = d.items.map(a => `
+      <div style="background:#161824;border-radius:10px;padding:14px;margin-bottom:10px;border-left:3px solid ${a.pinned?'#f6c90e':'#5a60e8'}">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          ${a.pinned?'<span class="tag tag-pinned">📌 置顶</span>':''}
+          <strong>${esc(a.title)}</strong>
+          <span style="flex:1"></span>
+          <span style="color:#a0aec0;font-size:12px">${fmtTs(a.created_at)} · ${esc(a.author)}</span>
+          <button class="btn-danger btn-sm" onclick="delAnnounce(${a.id})">删除</button>
+        </div>
+        <div style="color:#c8ccff;font-size:13px;line-height:1.6;white-space:pre-wrap">${esc(a.content)}</div>
+      </div>`).join('');
+  } catch(e) { toast('加载失败: '+e.message, true); }
+}
+
+function showAnnounceModal() {
+  document.getElementById('annTitle').value='';
+  document.getElementById('annContent').value='';
+  document.getElementById('annPinned').checked=false;
+  openModal('announceModal');
+}
+
+async function postAnnounce() {
+  const title = document.getElementById('annTitle').value.trim();
+  const content = document.getElementById('annContent').value.trim();
+  if (!title||!content) { toast('标题和内容不能为空', true); return; }
+  try {
+    await api('POST', '/api/announcements', {title, content, pinned: document.getElementById('annPinned').checked});
+    toast('✅ 已发布'); closeModal('announceModal'); loadAnnounce();
+  } catch(e) { toast(e.message, true); }
 }
 
 async function delAnnounce(id) {
-  if (!confirm('确认删除此公告？')) return;
-  try { await api('DELETE', `/api/announcements/${id}`); loadAnnouncements(); }
-  catch(e) { alert(e.message); }
+  if (!confirm('确认删除该公告？')) return;
+  try { await api('DELETE', `/api/announcements/${id}`); toast('已删除'); loadAnnounce(); }
+  catch(e) { toast(e.message, true); }
 }
 
-function openAnnounceModal() {
-  document.getElementById('announceModal').style.display = 'flex';
-  document.getElementById('ann-title').value = '';
-  document.getElementById('ann-content').value = '';
-  document.getElementById('ann-pinned').checked = false;
-  document.getElementById('ann-err').textContent = '';
-}
-
-async function doPostAnnounce() {
-  const title = document.getElementById('ann-title').value.trim();
-  const content = document.getElementById('ann-content').value.trim();
-  const pinned = document.getElementById('ann-pinned').checked;
-  if (!title || !content) { document.getElementById('ann-err').textContent = '标题和内容不能为空'; return; }
-  try {
-    await api('POST', '/api/announcements', {title, content, pinned});
-    document.getElementById('announceModal').style.display = 'none';
-    loadAnnouncements();
-  } catch(e) { document.getElementById('ann-err').textContent = e.message; }
-}
-
-// ── 聊天记录 ──────────────────────────────────────────────────────────────────
+// ── CHAT ──────────────────────────────────────────────────────────────────────
 async function loadChat() {
-  const q = document.getElementById('chatSearch').value.trim();
+  const q = document.getElementById('chatUserSearch').value.toLowerCase();
   try {
     const d = await api('GET', '/api/chat?since=0');
-    const msgs = d.messages.filter(m => !q || m.username.includes(q));
-    const body = document.getElementById('chatBody');
-    if (!msgs.length) { body.innerHTML = '<p style="color:#64748b">暂无消息</p>'; return; }
-    body.innerHTML = '<table><thead><tr><th>ID</th><th>用户名</th><th>内容</th><th>时间</th><th>操作</th></tr></thead><tbody>' +
-      msgs.map(m => `<tr>
-        <td>${m.id}</td>
-        <td><b>${esc(m.username)}</b></td>
-        <td style="max-width:400px;word-break:break-all">${esc(m.content)}</td>
-        <td>${fmtTime(m.ts)}</td>
-        <td><button class="sm-btn danger" onclick="delChat(${m.id})">删除</button></td>
-      </tr>`).join('') + '</tbody></table>';
-  } catch(e) { document.getElementById('chatBody').innerHTML = `<p style="color:#ef4444">${e.message}</p>`; }
+    const el = document.getElementById('chatList');
+    const msgs = (d.messages||[]).filter(m => !q || m.username.toLowerCase().includes(q));
+    if (!msgs.length) { el.innerHTML='<p style="color:#a0aec0">暂无消息</p>'; return; }
+    el.innerHTML = msgs.map(m => {
+      const avHtml = m.avatar && m.avatar.length > 50
+        ? `<div class="av"><img src="data:image/png;base64,${m.avatar}"></div>`
+        : `<div class="av">${esc(m.avatar || m.username.charAt(0).toUpperCase())}</div>`;
+      return `<div style="display:flex;align-items:flex-start;gap:10px;padding:8px;border-radius:8px;background:#161824">
+        ${avHtml}
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:2px">
+            <strong style="font-size:13px">${esc(m.username)}</strong>
+            <span style="color:#a0aec0;font-size:11px">${fmtTs(m.ts)}</span>
+            <span style="flex:1"></span>
+            <button class="btn-danger btn-sm" onclick="delChat(${m.id})">删除</button>
+          </div>
+          <div style="color:#c8ccff;word-break:break-word">${esc(m.content)}</div>
+        </div>
+      </div>`;
+    }).join('');
+  } catch(e) { toast('加载失败: '+e.message, true); }
 }
 
 async function delChat(id) {
-  if (!confirm('确认删除此消息？')) return;
-  try { await api('DELETE', `/api/chat/${id}`); loadChat(); }
-  catch(e) { alert(e.message); }
+  if (!confirm('确认删除该消息？')) return;
+  try { await api('DELETE', `/api/chat/${id}`); toast('已删除'); loadChat(); }
+  catch(e) { toast(e.message, true); }
 }
 
-// ── 论坛管理 ──────────────────────────────────────────────────────────────────
+// ── FORUM ─────────────────────────────────────────────────────────────────────
 let forumPage = 1;
-async function loadForum() {
+async function loadForum(page=1) {
+  forumPage = page;
+  document.getElementById('forumList').style.display='block';
+  document.getElementById('forumDetail').style.display='none';
   try {
-    const d = await api('GET', `/api/forum/posts?page=${forumPage}`);
-    const totalPages = Math.max(1, Math.ceil(d.total / 20));
-    document.getElementById('forumPageInfo').textContent = `第 ${forumPage}/${totalPages} 页，共 ${d.total} 帖`;
-    document.getElementById('forumPrev').disabled = forumPage <= 1;
-    document.getElementById('forumNext').disabled = forumPage >= totalPages;
-    const body = document.getElementById('forumBody');
-    if (!d.posts.length) { body.innerHTML = '<p style="color:#64748b">暂无帖子</p>'; return; }
-    body.innerHTML = '<table><thead><tr><th>ID</th><th>标题</th><th>作者</th><th>回复数</th><th>时间</th><th>操作</th></tr></thead><tbody>' +
-      d.posts.map(p => `<tr>
+    const d = await api('GET', `/api/forum/posts?page=${page}`);
+    const tbody = document.getElementById('forumTbody');
+    tbody.innerHTML = (d.posts||[]).map(p => {
+      const avHtml = p.avatar && p.avatar.length > 50
+        ? `<div class="av" style="width:24px;height:24px;font-size:10px;display:inline-flex"><img src="data:image/png;base64,${p.avatar}"></div>`
+        : `<div class="av" style="width:24px;height:24px;font-size:10px;display:inline-flex">${esc(p.avatar||p.author.charAt(0).toUpperCase())}</div>`;
+      return `<tr>
         <td>${p.id}</td>
-        <td>${esc(p.title)}</td>
-        <td>${esc(p.author)}</td>
+        <td style="max-width:320px;white-space:normal"><a href="#" onclick="viewPost(${p.id})" style="color:#7c83ff">${esc(p.title)}</a></td>
+        <td style="display:flex;align-items:center;gap:6px">${avHtml} ${esc(p.author)}</td>
         <td>${p.replies}</td>
-        <td>${fmtTime(p.created_at)}</td>
-        <td><button class="sm-btn danger" onclick="delPost(${p.id})">删除</button></td>
-      </tr>`).join('') + '</tbody></table>';
-  } catch(e) { document.getElementById('forumBody').innerHTML = `<p style="color:#ef4444">${e.message}</p>`; }
+        <td>${fmtTs(p.created_at)}</td>
+        <td><button class="btn-danger btn-sm" onclick="delPost(${p.id})">删除</button></td>
+      </tr>`;
+    }).join('');
+    renderPagination('forumPagination', d.page, Math.ceil(d.total/20), loadForum);
+  } catch(e) { toast('加载失败: '+e.message, true); }
 }
 
-async function delPost(id) {
-  if (!confirm('确认删除此帖子及所有回复？')) return;
-  try { await api('DELETE', `/api/forum/posts/${id}`); loadForum(); }
-  catch(e) { alert(e.message); }
-}
-function changeForumPage(d) { forumPage += d; loadForum(); }
-
-// ── 云盘管理 ──────────────────────────────────────────────────────────────────
-async function loadCloud() {
-  const q = document.getElementById('cloudSearch').value.trim();
+async function viewPost(pid) {
+  document.getElementById('forumList').style.display='none';
+  const det = document.getElementById('forumDetail');
+  det.style.display='block';
+  det.innerHTML='<div class="panel"><p style="color:#a0aec0">加载中…</p></div>';
   try {
-    const d = await api('GET', `/admin/cloud/files${q ? '?username=' + encodeURIComponent(q) : ''}`);
-    const body = document.getElementById('cloudBody');
-    if (!d.files.length) { body.innerHTML = '<p style="color:#64748b">暂无文件</p>'; return; }
-    body.innerHTML = '<table><thead><tr><th>文件名</th><th>所有者</th><th>大小</th><th>上传时间</th><th>操作</th></tr></thead><tbody>' +
-      d.files.map(f => `<tr>
-        <td>${esc(f.filename)}</td>
-        <td>${esc(f.owner)}</td>
-        <td>${fmtSize(f.size)}</td>
-        <td>${fmtTime(f.created_at)}</td>
-        <td><button class="sm-btn danger" onclick="delCloudFile('${f.id}','${esc(f.owner)}')">删除</button></td>
-      </tr>`).join('') + '</tbody></table>';
-  } catch(e) { document.getElementById('cloudBody').innerHTML = `<p style="color:#ef4444">${e.message}</p>`; }
+    const d = await api('GET', `/api/forum/posts/${pid}`);
+    const p = d.post;
+    const avHtml = p.avatar && p.avatar.length > 50
+      ? `<div class="av" style="width:40px;height:40px;font-size:16px"><img src="data:image/png;base64,${p.avatar}"></div>`
+      : `<div class="av" style="width:40px;height:40px;font-size:16px">${esc(p.avatar||p.author.charAt(0).toUpperCase())}</div>`;
+    const comments = (d.comments||[]).map(c => {
+      const cav = c.avatar && c.avatar.length > 50
+        ? `<div class="av" style="width:28px;height:28px;font-size:11px"><img src="data:image/png;base64,${c.avatar}"></div>`
+        : `<div class="av" style="width:28px;height:28px;font-size:11px">${esc(c.avatar||c.author.charAt(0).toUpperCase())}</div>`;
+      return `<div style="display:flex;gap:10px;padding:10px;border-radius:8px;background:#252840;margin-bottom:8px">
+        ${cav}
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:4px">
+            <strong style="font-size:12px">${esc(c.author)}</strong>
+            <span style="color:#a0aec0;font-size:11px">${fmtTs(c.created_at)}</span>
+          </div>
+          <div style="color:#c8ccff;word-break:break-word;font-size:13px">${esc(c.content)}</div>
+        </div>
+      </div>`;
+    }).join('');
+    det.innerHTML = `<div class="panel">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+        <button class="btn-secondary btn-sm" onclick="loadForum(${forumPage})">← 返回列表</button>
+        <button class="btn-danger btn-sm" onclick="delPost(${p.id})">🗑 删除帖子</button>
+      </div>
+      <div style="display:flex;gap:14px;align-items:flex-start;margin-bottom:16px">
+        ${avHtml}
+        <div>
+          <h2>${esc(p.title)}</h2>
+          <div style="color:#a0aec0;font-size:12px;margin-top:4px">${esc(p.author)} · ${fmtTs(p.created_at)}</div>
+        </div>
+      </div>
+      <div class="post-content">${esc(p.content)}</div>
+      <h3 style="margin-top:20px;margin-bottom:12px">💬 ${d.comments.length} 条回复</h3>
+      ${comments || '<p style="color:#a0aec0;font-size:13px">暂无回复</p>'}
+    </div>`;
+  } catch(e) { det.innerHTML=`<div class="panel" style="color:#f08080">加载失败: ${e.message}</div>`; }
+}
+
+async function delPost(pid) {
+  if (!confirm('确认删除该帖子及所有回复？')) return;
+  try { await api('DELETE', `/api/forum/posts/${pid}`); toast('已删除'); loadForum(forumPage); }
+  catch(e) { toast(e.message, true); }
+}
+
+// ── CLOUD ─────────────────────────────────────────────────────────────────────
+let cloudPage = 1;
+async function loadCloud(page=1) {
+  cloudPage = page;
+  const q = document.getElementById('cloudUserSearch').value;
+  try {
+    const d = await api('GET', `/admin/cloud/files?username=${encodeURIComponent(q)}&page=${page}`);
+    const tbody = document.getElementById('cloudTbody');
+    tbody.innerHTML = (d.files||[]).map(f => `<tr>
+      <td>${esc(f.owner)}</td>
+      <td title="${esc(f.filename)}">${esc(f.filename)}</td>
+      <td>${fmtSize(f.size)}</td>
+      <td>${fmtTs(f.created_at)}</td>
+      <td style="white-space:nowrap">
+        <button class="btn-success btn-sm" onclick="downloadFile('${f.id}','${esc(f.filename)}')">⬇ 下载</button>
+        <button class="btn-danger btn-sm" onclick="delCloudFile('${f.id}','${esc(f.owner)}')">🗑 删除</button>
+      </td>
+    </tr>`).join('');
+    renderPagination('cloudPagination', d.page||1, d.pages||1, loadCloud);
+    const totalBytes = (d.files||[]).reduce((s,f)=>s+f.size,0);
+    document.getElementById('cloudStats').textContent =
+      `共 ${d.total||d.files.length} 个文件，本页合计 ${fmtSize(totalBytes)}`;
+  } catch(e) { toast('加载失败: '+e.message, true); }
+}
+
+async function downloadFile(fid, fname) {
+  try {
+    toast('⏳ 准备下载…');
+    const d = await api('GET', `/api/cloud/download/${fid}`);
+    const b64 = d.data;
+    const raw = atob(b64);
+    const bytes = new Uint8Array(raw.length);
+    for (let i=0;i<raw.length;i++) bytes[i]=raw.charCodeAt(i);
+    const blob = new Blob([bytes]);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href=url; a.download=fname; a.click();
+    URL.revokeObjectURL(url);
+    toast('✅ 下载完成');
+  } catch(e) { toast('下载失败: '+e.message, true); }
 }
 
 async function delCloudFile(id, owner) {
   if (!confirm(`确认删除 ${owner} 的文件？`)) return;
-  try { await api('DELETE', `/admin/cloud/files/${id}`); loadCloud(); }
-  catch(e) { alert(e.message); }
+  try { await api('DELETE', `/admin/cloud/files/${id}`); toast('已删除'); loadCloud(cloudPage); }
+  catch(e) { toast(e.message, true); }
+}
+
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+function renderPagination(elId, page, pages, fn) {
+  const el = document.getElementById(elId);
+  if (!pages || pages <= 1) { el.innerHTML=''; return; }
+  let html = `<button ${page<=1?'disabled':''} onclick="${fn.name}(${page-1})">‹ 上一页</button>`;
+  const start = Math.max(1, page-2), end = Math.min(pages, page+2);
+  if (start>1) html += `<button onclick="${fn.name}(1)">1</button>${start>2?'<span style="color:#a0aec0">…</span>':''}`;
+  for (let i=start;i<=end;i++) html+=`<button class="${i===page?'active':''}" onclick="${fn.name}(${i})">${i}</button>`;
+  if (end<pages) html+=`${end<pages-1?'<span style="color:#a0aec0">…</span>':''}<button onclick="${fn.name}(${pages})">${pages}</button>`;
+  html += `<button ${page>=pages?'disabled':''} onclick="${fn.name}(${page+1})">下一页 ›</button>`;
+  html += `<span style="color:#a0aec0;font-size:12px">第 ${page} / ${pages} 页</span>`;
+  el.innerHTML = html;
 }
 
 function fmtSize(b) {
+  if (!b) return '0 B';
   if (b < 1024) return b + ' B';
   if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
   return (b/1048576).toFixed(1) + ' MB';
+}
+
+function fmtTs(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  return d.toLocaleDateString('zh-CN') + ' ' + d.toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit'});
 }
 
 function esc(s) {
