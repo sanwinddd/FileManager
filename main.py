@@ -879,7 +879,7 @@ async def get_public_profile(username: str, user=Depends(get_current_user)):
     db = get_db()
     try:
         row = db.execute(
-            "SELECT username,role,created_at,login_count,avatar FROM users WHERE username=? AND banned=0",
+            "SELECT username,role,created_at,login_count,avatar,vip FROM users WHERE username=? AND banned=0",
             (username,)).fetchone()
         if not row: raise HTTPException(404, "用户不存在")
         return dict(row)
