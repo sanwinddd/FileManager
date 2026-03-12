@@ -452,6 +452,164 @@ async def stats(_=Depends(require_admin)):
     finally:
         db.close()
 
+# ── AI 聊天 ──────────────────────────────────────────────────────────────────
+# ── AI 多模型支持 ─────────────────────────────────────────────────────────────
+import urllib.request as _ureq, json as _uj
+
+# 各服务商 API Key
+AI_KEYS = {
+    "anthropic": os.environ.get("ANTHROPIC_API_KEY", ""),
+    "openai":    os.environ.get("OPENAI_API_KEY", ""),       # OpenAI / Grok (同协议)
+    "deepseek":  os.environ.get("DEEPSEEK_API_KEY", ""),
+    "gemini":    os.environ.get("GEMINI_API_KEY", ""),
+    "grok":      os.environ.get("GROK_API_KEY", ""),
+    "groq":      os.environ.get("GROQ_API_KEY", ""),
+}
+
+# 模型列表：(display_name, provider, model_id)
+AI_MODELS = [
+    # Claude
+    ("Claude Sonnet 4",          "anthropic", "claude-sonnet-4-20250514"),
+    ("Claude Opus 4",            "anthropic", "claude-opus-4-5"),
+    ("Claude Haiku 3.5",         "anthropic", "claude-haiku-3-5-20241022"),
+    # DeepSeek
+    ("DeepSeek Chat",            "deepseek",  "deepseek-chat"),
+    ("DeepSeek Reasoner",        "deepseek",  "deepseek-reasoner"),
+    # Gemini
+    ("Gemini 2.0 Flash",         "gemini",    "gemini-2.0-flash"),
+    ("Gemini 1.5 Pro",           "gemini",    "gemini-1.5-pro"),
+    # Grok
+    ("Grok 3",                   "grok",      "grok-3"),
+    ("Grok 3 Mini",              "grok",      "grok-3-mini"),
+    # Groq (fast inference)
+    ("Llama 3.3 70B (Groq)",     "groq",      "llama-3.3-70b-versatile"),
+    ("Mixtral 8x7B (Groq)",      "groq",      "mixtral-8x7b-32768"),
+]
+AI_MODEL_MAP = {m[2]: m for m in AI_MODELS}   # model_id -> tuple
+
+def _call_ai(provider: str, model: str, messages: list,
+             system: Optional[str], max_tokens: int = 1024) -> str:
+    key = AI_KEYS.get(provider, "")
+    if not key:
+        raise HTTPException(503, f"未配置 {provider.upper()}_API_KEY")
+
+    # ── Anthropic ──────────────────────────────────────────────────────────
+    if provider == "anthropic":
+        payload: dict = {"model": model, "max_tokens": max_tokens, "messages": messages}
+        if system: payload["system"] = system
+        req = _ureq.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=_uj.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "x-api-key": key, "anthropic-version": "2023-06-01"},
+            method="POST")
+        try:
+            with _ureq.urlopen(req, timeout=60) as r:
+                return _uj.loads(r.read())["content"][0]["text"]
+        except _ureq.HTTPError as e:
+            err = _uj.loads(e.read()).get("error", {})
+            raise HTTPException(502, f"Anthropic: {err.get('message', str(e))}")
+
+    # ── Gemini ─────────────────────────────────────────────────────────────
+    if provider == "gemini":
+        # Gemini uses generateContent API with different message format
+        contents = []
+        if system:
+            contents.append({"role": "user", "parts": [{"text": "[系统提示] " + system}]})
+            contents.append({"role": "model", "parts": [{"text": "明白，我会按照要求回答。"}]})
+        for m in messages:
+            role = "model" if m["role"] == "assistant" else "user"
+            contents.append({"role": role, "parts": [{"text": m["content"]}]})
+        payload = {"contents": contents,
+                   "generationConfig": {"maxOutputTokens": max_tokens}}
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+        req = _ureq.Request(url, data=_uj.dumps(payload).encode(),
+                            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with _ureq.urlopen(req, timeout=60) as r:
+                result = _uj.loads(r.read())
+            return result["candidates"][0]["content"]["parts"][0]["text"]
+        except _ureq.HTTPError as e:
+            err = _uj.loads(e.read()).get("error", {})
+            raise HTTPException(502, f"Gemini: {err.get('message', str(e))}")
+
+    # ── OpenAI-compatible (DeepSeek / Grok / Groq / OpenAI) ───────────────
+    BASE_URLS = {
+        "openai":   "https://api.openai.com/v1/chat/completions",
+        "deepseek": "https://api.deepseek.com/v1/chat/completions",
+        "grok":     "https://api.x.ai/v1/chat/completions",
+        "groq":     "https://api.groq.com/openai/v1/chat/completions",
+    }
+    url = BASE_URLS.get(provider)
+    if not url:
+        raise HTTPException(400, f"未知 provider: {provider}")
+    msgs_payload = []
+    if system:
+        msgs_payload.append({"role": "system", "content": system})
+    msgs_payload.extend(messages)
+    payload = {"model": model, "max_tokens": max_tokens, "messages": msgs_payload}
+    req = _ureq.Request(url, data=_uj.dumps(payload).encode(),
+                        headers={"Content-Type": "application/json",
+                                 "Authorization": f"Bearer {key}"}, method="POST")
+    try:
+        with _ureq.urlopen(req, timeout=60) as r:
+            result = _uj.loads(r.read())
+        return result["choices"][0]["message"]["content"]
+    except _ureq.HTTPError as e:
+        try: err = _uj.loads(e.read()).get("error", {})
+        except: err = {}
+        raise HTTPException(502, f"{provider}: {err.get('message', str(e))}")
+    except Exception as e:
+        raise HTTPException(502, f"AI 请求失败: {e}")
+
+class AIChatReq(BaseModel):
+    messages: list
+    system:   Optional[str] = None
+    model:    str = "claude-sonnet-4-20250514"
+
+@app.get("/api/ai/models")
+async def list_ai_models(user=Depends(get_current_user)):
+    """返回可用模型列表（已配置 API Key 的）"""
+    result = []
+    for name, provider, mid in AI_MODELS:
+        result.append({
+            "name": name, "provider": provider, "model": mid,
+            "available": bool(AI_KEYS.get(provider))
+        })
+    return {"models": result}
+
+@app.get("/admin/ai/models")
+async def list_ai_models_admin(_=Depends(require_admin)):
+    result = []
+    for name, provider, mid in AI_MODELS:
+        result.append({
+            "name": name, "provider": provider, "model": mid,
+            "available": bool(AI_KEYS.get(provider))
+        })
+    return {"models": result}
+
+@app.get("/admin/ai/keys")
+async def list_ai_key_status(_=Depends(require_admin)):
+    return {k: bool(v) for k, v in AI_KEYS.items()}
+
+@app.post("/api/ai/chat")
+async def ai_chat(req: AIChatReq, user=Depends(get_current_user)):
+    info = AI_MODEL_MAP.get(req.model)
+    if not info:
+        raise HTTPException(400, f"未知模型: {req.model}")
+    _, provider, model = info
+    text = _call_ai(provider, model, req.messages, req.system, 1024)
+    return {"reply": text, "model": req.model, "provider": provider}
+
+@app.post("/admin/ai/chat")
+async def admin_ai_chat(req: AIChatReq, _=Depends(require_admin)):
+    info = AI_MODEL_MAP.get(req.model)
+    if not info:
+        raise HTTPException(400, f"未知模型: {req.model}")
+    _, provider, model = info
+    text = _call_ai(provider, model, req.messages, req.system, 2048)
+    return {"reply": text, "model": req.model, "provider": provider}
+
 # ── 用户 Profile ─────────────────────────────────────────────────────────────
 @app.get("/api/profile")
 async def get_profile(user=Depends(get_current_user)):
@@ -902,6 +1060,8 @@ tr:hover td{background:#252840}
     <a href="#" onclick="showTab('forum')" id="nav-forum">🗣 论坛管理</a>
     <div class="section-title">存储</div>
     <a href="#" onclick="showTab('cloud')" id="nav-cloud">☁️ 云盘管理</a>
+    <div class="section-title">AI</div>
+    <a href="#" onclick="showTab('ai')" id="nav-ai">🤖 AI 助手</a>
   </div>
 
   <!-- Main content -->
@@ -1000,7 +1160,55 @@ tr:hover td{background:#252840}
         <div id="cloudStats" style="margin-top:12px;color:#a0aec0;font-size:12px"></div>
       </div>
     </div>
+
+    <!-- AI -->
+    <div id="tab-ai" style="display:none">
+      <div class="panel" style="display:flex;flex-direction:column;height:calc(100vh - 120px)">
+        <!-- 顶部工具栏 -->
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+          <h2 style="margin:0;white-space:nowrap">🤖 AI 助手</h2>
+          <select id="aiModelSelect" style="flex:1;min-width:180px;max-width:280px;font-size:13px;padding:6px 10px" onchange="onAiModelChange()">
+            <option value="">加载模型中…</option>
+          </select>
+          <span id="aiProviderBadge" style="font-size:11px;padding:3px 8px;border-radius:10px;background:#252840;color:#a0aec0;white-space:nowrap"></span>
+          <span style="flex:1"></span>
+          <button class="btn-secondary btn-sm" onclick="showAiKeyStatus()">🔑 API Key 状态</button>
+          <button class="btn-secondary btn-sm" onclick="clearAiChat()">🗑 清空</button>
+        </div>
+        <!-- 系统提示词 -->
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+          <select id="aiSystemPreset" style="width:160px;font-size:12px;padding:5px 8px" onchange="applyAiPreset()">
+            <option value="">系统提示词…</option>
+            <option value="你是一个专业的系统管理员助手，帮助管理用户、分析日志和诊断问题。回答简洁专业。">系统管理员</option>
+            <option value="你是一个友好的客服助手，用中文回答用户问题，保持热情礼貌。">客服助手</option>
+            <option value="你是一个代码审查专家，专注于代码质量、安全性和性能优化。用中文解释。">代码审查</option>
+            <option value="你是一位数据分析专家，擅长分析用户数据、使用趋势和系统指标，给出洞察和建议。">数据分析</option>
+          </select>
+          <input id="aiSystemPrompt" placeholder="系统提示词（可选，留空使用模型默认）" style="flex:1;font-size:12px;padding:6px 10px">
+        </div>
+        <!-- 消息区 -->
+        <div id="aiMessages" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding:4px 2px;margin-bottom:12px;min-height:200px;border:1px solid #2d3148;border-radius:10px;padding:12px"></div>
+        <!-- 输入区 -->
+        <div style="display:flex;gap:8px;align-items:flex-end">
+          <textarea id="aiInput" rows="2" placeholder="输入消息，Ctrl+Enter 发送…"
+            style="flex:1;resize:vertical;min-height:52px;max-height:160px;font-size:14px"
+            onkeydown="if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();sendAdminAi();}"></textarea>
+          <button class="btn-primary" id="aiSendBtn" onclick="sendAdminAi()" style="padding:12px 20px;align-self:stretch;font-size:15px">发送</button>
+        </div>
+        <div style="font-size:11px;color:#4a5568;margin-top:5px">Ctrl+Enter 发送 · 支持 Claude / DeepSeek / Gemini / Grok / Groq</div>
+      </div>
+    </div>
   </div>
+</div>
+</div>
+
+<!-- AI Key 状态弹窗 -->
+<div class="modal-bg" id="aiKeyModal">
+<div class="modal" style="max-width:420px">
+  <h2>🔑 AI API Key 状态</h2>
+  <div id="aiKeyList" style="margin:14px 0;display:flex;flex-direction:column;gap:8px"></div>
+  <div style="font-size:12px;color:#a0aec0;margin-bottom:12px">在 Railway 环境变量中配置对应 Key 后重新部署即可启用</div>
+  <div class="modal-footer"><button class="btn-secondary" onclick="closeModal('aiKeyModal')">关闭</button></div>
 </div>
 </div>
 
@@ -1117,7 +1325,7 @@ async function doLogin() {
 
 function doLogout() { token=''; location.reload(); }
 
-const TABS = ['overview','users','logs','announce','chat','forum','cloud'];
+const TABS = ['overview','users','logs','announce','chat','forum','cloud','ai'];
 function showTab(name) {
   TABS.forEach(t => {
     document.getElementById('tab-'+t).style.display = t===name ? 'block' : 'none';
@@ -1131,6 +1339,7 @@ function showTab(name) {
   else if (name==='chat') loadChat();
   else if (name==='forum') loadForum(1);
   else if (name==='cloud') loadCloud(1);
+  else if (name==='ai') initAdminAi();
 }
 
 function openModal(id) { document.getElementById(id).classList.add('open'); }
@@ -1563,6 +1772,140 @@ function fmtTs(ts) {
 
 function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── AI CHAT (Admin) ───────────────────────────────────────────────────────────
+let adminAiHistory = [];
+let adminAiBusy = false;
+let adminAiModel = '';
+
+const PROVIDER_COLORS = {
+  anthropic:'#c8a96e', deepseek:'#4fa3e0', gemini:'#4285f4',
+  grok:'#1d9bf0', groq:'#f55036', openai:'#10a37f'
+};
+const PROVIDER_LABELS = {
+  anthropic:'Claude', deepseek:'DeepSeek', gemini:'Gemini',
+  grok:'Grok', groq:'Groq', openai:'OpenAI'
+};
+
+async function initAdminAi() {
+  try {
+    const d = await api('GET', '/admin/ai/models');
+    const sel = document.getElementById('aiModelSelect');
+    sel.innerHTML = '';
+    let firstAvail = '';
+    const byProvider = {};
+    for (const m of d.models) {
+      if (!byProvider[m.provider]) byProvider[m.provider] = [];
+      byProvider[m.provider].push(m);
+    }
+    for (const [prov, models] of Object.entries(byProvider)) {
+      const grp = document.createElement('optgroup');
+      grp.label = (PROVIDER_LABELS[prov]||prov) + (models.some(m=>m.available) ? '' : ' (未配置)');
+      for (const m of models) {
+        const opt = document.createElement('option');
+        opt.value = m.model; opt.textContent = m.name + (m.available ? '' : ' ⚠');
+        opt.disabled = !m.available;
+        if (m.available && !firstAvail) firstAvail = m.model;
+        grp.appendChild(opt);
+      }
+      sel.appendChild(grp);
+    }
+    if (firstAvail) { sel.value = firstAvail; adminAiModel = firstAvail; onAiModelChange(); }
+  } catch(e) { toast('模型加载失败: '+e.message, true); }
+  if (adminAiHistory.length === 0) renderAdminAiMessages();
+}
+
+function onAiModelChange() {
+  const sel = document.getElementById('aiModelSelect');
+  adminAiModel = sel.value;
+  const provBadge = document.getElementById('aiProviderBadge');
+  const grpLabel = sel.options[sel.selectedIndex]?.parentElement?.label || '';
+  const prov = Object.entries(PROVIDER_LABELS).find(([k,v]) => grpLabel.startsWith(v))?.[0] || '';
+  provBadge.textContent = prov ? (PROVIDER_LABELS[prov]||prov) : '';
+  provBadge.style.color = PROVIDER_COLORS[prov] || '#a0aec0';
+}
+
+async function showAiKeyStatus() {
+  try {
+    const d = await api('GET', '/admin/ai/keys');
+    const list = document.getElementById('aiKeyList');
+    const envNames = {anthropic:'ANTHROPIC_API_KEY',openai:'OPENAI_API_KEY',
+      deepseek:'DEEPSEEK_API_KEY',gemini:'GEMINI_API_KEY',grok:'GROK_API_KEY',groq:'GROQ_API_KEY'};
+    list.innerHTML = Object.entries(d).map(([k,v]) => `
+      <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:#161824;border-radius:8px">
+        <span style="color:${PROVIDER_COLORS[k]||'#a0aec0'};font-weight:700;width:80px">${PROVIDER_LABELS[k]||k}</span>
+        <code style="font-size:11px;color:#a0aec0;flex:1">${envNames[k]||''}</code>
+        <span style="font-weight:700;${v?'color:#48bb78':'color:#f08080'}">${v?'✅ 已配置':'❌ 未配置'}</span>
+      </div>`).join('');
+    openModal('aiKeyModal');
+  } catch(e) { toast(e.message, true); }
+}
+
+function applyAiPreset() {
+  const val = document.getElementById('aiSystemPreset').value;
+  if (val) document.getElementById('aiSystemPrompt').value = val;
+}
+
+function clearAiChat() { adminAiHistory = []; renderAdminAiMessages(); }
+
+function renderAdminAiMessages() {
+  const el = document.getElementById('aiMessages');
+  if (!el) return;
+  if (adminAiHistory.length === 0) {
+    el.innerHTML = `<div style="text-align:center;color:#4a5568;padding:40px 0;font-size:13px">
+      🤖 选择模型后开始对话<br><span style="font-size:11px;margin-top:6px;display:block">支持 Claude · DeepSeek · Gemini · Grok · Groq</span></div>`;
+    return;
+  }
+  el.innerHTML = adminAiHistory.map(m => {
+    const isUser = m.role === 'user';
+    const modelTag = (!isUser && m.model) ? `<div style="font-size:10px;color:#4a5568;margin-bottom:3px">${esc(m.model)}</div>` : '';
+    return `<div style="display:flex;justify-content:${isUser?'flex-end':'flex-start'};margin-bottom:2px">
+      <div style="max-width:82%">${isUser?'':modelTag}
+        <div style="padding:10px 14px;border-radius:${isUser?'14px 4px 14px 14px':'4px 14px 14px 14px'};
+          background:${isUser?'#5a60e8':'#252840'};color:#e2e8f0;font-size:13px;line-height:1.65;white-space:pre-wrap;word-break:break-word">
+          ${isUser?esc(m.content):formatAiText(m.content)}</div>
+      </div></div>`;
+  }).join('');
+  el.scrollTop = el.scrollHeight;
+}
+
+function formatAiText(text) {
+  return esc(text)
+    .replace(/```([\s\S]*?)```/g, (_,c)=>`<pre style="background:#161824;padding:10px;border-radius:6px;overflow-x:auto;font-size:12px;margin:6px 0;line-height:1.5">${c.replace(/^[a-z]+\n/,'')}</pre>`)
+    .replace(/`([^`\n]+)`/g,'<code style="background:#161824;padding:1px 5px;border-radius:3px;font-size:12px">$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+}
+
+async function sendAdminAi() {
+  if (adminAiBusy) return;
+  if (!adminAiModel) { toast('请先选择模型', true); return; }
+  const input = document.getElementById('aiInput');
+  const text = input.value.trim(); if (!text) return;
+  adminAiBusy = true;
+  const btn = document.getElementById('aiSendBtn');
+  btn.disabled = true; btn.textContent = '⏳'; input.value = '';
+  adminAiHistory.push({role:'user', content:text});
+  renderAdminAiMessages();
+  const el = document.getElementById('aiMessages');
+  const thinking = document.createElement('div');
+  thinking.style.cssText = 'display:flex;justify-content:flex-start';
+  thinking.innerHTML = `<div style="padding:10px 14px;border-radius:4px 14px 14px 14px;background:#252840;color:#7c83ff;font-size:13px">⏳ 思考中…</div>`;
+  el.appendChild(thinking); el.scrollTop = el.scrollHeight;
+  const sysPrompt = document.getElementById('aiSystemPrompt').value.trim();
+  try {
+    const msgs = adminAiHistory.map(m=>({role:m.role, content:m.content}));
+    const d = await api('POST', '/admin/ai/chat', {messages:msgs, system:sysPrompt||null, model:adminAiModel});
+    thinking.remove();
+    adminAiHistory.push({role:'assistant', content:d.reply, model:d.model});
+    renderAdminAiMessages();
+  } catch(e) {
+    thinking.remove();
+    adminAiHistory.push({role:'assistant', content:'❌ 错误：'+e.message});
+    renderAdminAiMessages(); toast(e.message, true);
+  } finally {
+    adminAiBusy = false; btn.disabled = false; btn.textContent = '发送'; input.focus();
+  }
 }
 </script>
 </body>
