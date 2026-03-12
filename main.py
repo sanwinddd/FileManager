@@ -395,13 +395,14 @@ async def get_profile(user=Depends(get_current_user)):
     db = get_db()
     try:
         row = db.execute(
-            "SELECT username,email,role,created_at,last_login,login_count,last_ip,device_info FROM users WHERE username=?",
+            "SELECT username,email,role,created_at,last_login,login_count,last_ip,device_info,avatar FROM users WHERE username=?",
             (user["sub"],)).fetchone()
         if not row: raise HTTPException(404, "用户不存在")
         import json as _j
         d = dict(row)
         try: d["device_info"] = _j.loads(d["device_info"] or "{}")
         except: d["device_info"] = {}
+        d["avatar"] = d.get("avatar") or ""
         return d
     finally:
         db.close()
@@ -409,11 +410,61 @@ async def get_profile(user=Depends(get_current_user)):
 @app.post("/api/profile/avatar")
 async def set_avatar(req: Request, user=Depends(get_current_user)):
     body = await req.json()
-    avatar = str(body.get("avatar", ""))[:4]   # 最多4字符 emoji
+    avatar = str(body.get("avatar", ""))[:8]
     db = get_db()
     try:
         db.execute("UPDATE users SET avatar=? WHERE username=?", (avatar, user["sub"]))
         db.commit(); return {"message": "已更新"}
+    finally:
+        db.close()
+
+class UpdateProfileReq(BaseModel):
+    email:        Optional[str] = None
+    old_password: Optional[str] = None
+    new_password: Optional[str] = None
+
+@app.post("/api/profile/update")
+async def update_profile(req: UpdateProfileReq, user=Depends(get_current_user)):
+    db = get_db()
+    try:
+        fields, vals = [], []
+        if req.email is not None:
+            fields.append("email=?"); vals.append(req.email)
+        if req.new_password is not None:
+            row = db.execute("SELECT pw_hash FROM users WHERE username=?", (user["sub"],)).fetchone()
+            if not row: raise HTTPException(404)
+            if hash_pw(req.old_password or "") != row["pw_hash"]:
+                raise HTTPException(400, "当前密码错误")
+            if len(req.new_password) < 4:
+                raise HTTPException(400, "新密码至少4个字符")
+            fields.append("pw_hash=?"); vals.append(hash_pw(req.new_password))
+        if not fields: raise HTTPException(400, "无更新内容")
+        vals.append(user["sub"])
+        db.execute(f"UPDATE users SET {','.join(fields)} WHERE username=?", vals)
+        db.commit(); return {"message": "已更新"}
+    finally:
+        db.close()
+
+@app.get("/api/users/{username}")
+async def get_public_profile(username: str, user=Depends(get_current_user)):
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT username,role,created_at,login_count,avatar FROM users WHERE username=? AND banned=0",
+            (username,)).fetchone()
+        if not row: raise HTTPException(404, "用户不存在")
+        return dict(row)
+    finally:
+        db.close()
+
+@app.get("/api/cloud/stats")
+async def cloud_stats(user=Depends(get_current_user)):
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT COUNT(*) as cnt, COALESCE(SUM(size),0) as total FROM cloud_files WHERE owner=?",
+            (user["sub"],)).fetchone()
+        return {"count": row["cnt"], "total_bytes": row["total"]}
     finally:
         db.close()
 
@@ -464,7 +515,9 @@ async def get_chat(since: int = 0, user=Depends(get_current_user)):
     db = get_db()
     try:
         rows = db.execute(
-            "SELECT id,username,content,ts FROM chat_messages WHERE ts>? ORDER BY ts ASC LIMIT 100",
+            "SELECT c.id,c.username,c.content,c.ts,COALESCE(u.avatar,'') as avatar "
+            "FROM chat_messages c LEFT JOIN users u ON c.username=u.username "
+            "WHERE c.ts>? ORDER BY c.ts ASC LIMIT 100",
             (since,)).fetchall()
         return {"messages": [dict(r) for r in rows]}
     finally:
@@ -500,8 +553,10 @@ async def list_posts(page: int = 1, user=Depends(get_current_user)):
         total = db.execute("SELECT COUNT(*) FROM forum_posts").fetchone()[0]
         rows  = db.execute(
             "SELECT p.id,p.title,p.author,p.created_at,"
-            "(SELECT COUNT(*) FROM forum_comments WHERE post_id=p.id) AS replies "
-            "FROM forum_posts p ORDER BY p.id DESC LIMIT ? OFFSET ?",
+            "(SELECT COUNT(*) FROM forum_comments WHERE post_id=p.id) AS replies,"
+            "COALESCE(u.avatar,'') as avatar "
+            "FROM forum_posts p LEFT JOIN users u ON p.author=u.username "
+            "ORDER BY p.id DESC LIMIT ? OFFSET ?",
             (per, (page-1)*per)).fetchall()
         return {"total": total, "page": page, "posts": [dict(r) for r in rows]}
     finally:
@@ -523,10 +578,14 @@ async def create_post(req: PostReq, user=Depends(get_current_user)):
 async def get_post(pid: int, user=Depends(get_current_user)):
     db = get_db()
     try:
-        post = db.execute("SELECT * FROM forum_posts WHERE id=?", (pid,)).fetchone()
+        post = db.execute(
+            "SELECT p.*,COALESCE(u.avatar,'') as avatar FROM forum_posts p "
+            "LEFT JOIN users u ON p.author=u.username WHERE p.id=?", (pid,)).fetchone()
         if not post: raise HTTPException(404, "帖子不存在")
         comments = db.execute(
-            "SELECT id,author,content,created_at FROM forum_comments WHERE post_id=? ORDER BY id ASC",
+            "SELECT c.id,c.author,c.content,c.created_at,COALESCE(u.avatar,'') as avatar "
+            "FROM forum_comments c LEFT JOIN users u ON c.author=u.username "
+            "WHERE c.post_id=? ORDER BY c.id ASC",
             (pid,)).fetchall()
         return {"post": dict(post), "comments": [dict(c) for c in comments]}
     finally:
