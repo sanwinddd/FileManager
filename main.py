@@ -101,6 +101,23 @@ def init_db():
             size       INTEGER NOT NULL,
             created_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS ai_sessions (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            username   TEXT    NOT NULL,
+            session_id TEXT    NOT NULL UNIQUE,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ai_messages (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id  TEXT    NOT NULL,
+            username    TEXT    NOT NULL,
+            role        TEXT    NOT NULL,   -- 'user' | 'assistant' | 'admin'
+            content     TEXT    NOT NULL,
+            model       TEXT    DEFAULT '',
+            sender_name TEXT    DEFAULT '', -- admin username when role='admin'
+            ts          INTEGER NOT NULL
+        );
     """)
     db.commit(); db.close()
 
@@ -610,6 +627,152 @@ async def admin_ai_chat(req: AIChatReq, _=Depends(require_admin)):
     text = _call_ai(provider, model, req.messages, req.system, 2048)
     return {"reply": text, "model": req.model, "provider": provider}
 
+# ── AI 聊天记录 & 管理员回复 ──────────────────────────────────────────────────
+import uuid as _uuid
+
+class AISaveReq(BaseModel):
+    session_id: str
+    messages:   list   # [{role,content,model,sender_name}]
+
+class AdminReplyReq(BaseModel):
+    content: str
+
+@app.post("/api/ai/session/save")
+async def ai_save_session(req: AISaveReq, user=Depends(get_current_user)):
+    """客户端每次对话后同步消息到服务端"""
+    db = get_db()
+    try:
+        now = int(time.time())
+        # 确保 session 存在
+        row = db.execute("SELECT id FROM ai_sessions WHERE session_id=? AND username=?",
+                         (req.session_id, user["sub"])).fetchone()
+        if not row:
+            db.execute("INSERT INTO ai_sessions (username,session_id,created_at,updated_at) VALUES (?,?,?,?)",
+                       (user["sub"], req.session_id, now, now))
+        else:
+            db.execute("UPDATE ai_sessions SET updated_at=? WHERE session_id=?", (now, req.session_id))
+        # 删旧消息重写（简单策略）
+        db.execute("DELETE FROM ai_messages WHERE session_id=? AND role != 'admin'", (req.session_id,))
+        for m in req.messages:
+            role = m.get("role","user")
+            if role == "admin": continue   # 不覆盖管理员消息
+            db.execute(
+                "INSERT INTO ai_messages (session_id,username,role,content,model,sender_name,ts) VALUES (?,?,?,?,?,?,?)",
+                (req.session_id, user["sub"], role,
+                 m.get("content",""), m.get("model",""), m.get("sender_name",""), now))
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+@app.get("/api/ai/session/messages")
+async def ai_get_session(session_id: str, since: int = 0, user=Depends(get_current_user)):
+    """拉取本会话消息（含管理员回复），since=时间戳可增量拉取"""
+    db = get_db()
+    try:
+        rows = db.execute(
+            "SELECT role,content,model,sender_name,ts FROM ai_messages "
+            "WHERE session_id=? AND username=? AND ts>? ORDER BY id ASC",
+            (session_id, user["sub"], since)).fetchall()
+        return {"messages": [dict(r) for r in rows]}
+    finally:
+        db.close()
+
+@app.get("/api/ai/session/id")
+async def ai_get_or_create_session(user=Depends(get_current_user)):
+    """获取用户最近 session_id，没有则新建"""
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT session_id FROM ai_sessions WHERE username=? ORDER BY updated_at DESC LIMIT 1",
+            (user["sub"],)).fetchone()
+        if row:
+            return {"session_id": row["session_id"]}
+        sid = str(_uuid.uuid4())
+        now = int(time.time())
+        db.execute("INSERT INTO ai_sessions (username,session_id,created_at,updated_at) VALUES (?,?,?,?)",
+                   (user["sub"], sid, now, now))
+        db.commit()
+        return {"session_id": sid}
+    finally:
+        db.close()
+
+# ── Admin: 查看所有用户 AI 聊天会话 ──────────────────────────────────────────
+@app.get("/admin/ai/sessions")
+async def admin_list_sessions(page: int = 1, q: str = "", _=Depends(require_admin)):
+    db = get_db()
+    try:
+        per = 30
+        like = f"%{q}%"
+        total = db.execute("SELECT COUNT(*) FROM ai_sessions WHERE username LIKE ?", (like,)).fetchone()[0]
+        rows = db.execute(
+            "SELECT s.username, s.session_id, s.updated_at, "
+            "  (SELECT COUNT(*) FROM ai_messages m WHERE m.session_id=s.session_id) as msg_count, "
+            "  (SELECT COUNT(*) FROM ai_messages m WHERE m.session_id=s.session_id AND m.role='admin') as admin_count "
+            "FROM ai_sessions s WHERE s.username LIKE ? ORDER BY s.updated_at DESC LIMIT ? OFFSET ?",
+            (like, per, (page-1)*per)).fetchall()
+        pages = max(1, (total+per-1)//per)
+        return {"sessions": [dict(r) for r in rows], "total": total, "page": page, "pages": pages}
+    finally:
+        db.close()
+
+@app.get("/admin/ai/sessions/{username}")
+async def admin_get_user_sessions(username: str, _=Depends(require_admin)):
+    db = get_db()
+    try:
+        sessions = db.execute(
+            "SELECT session_id, created_at, updated_at FROM ai_sessions WHERE username=? ORDER BY updated_at DESC",
+            (username,)).fetchall()
+        result = []
+        for s in sessions:
+            msgs = db.execute(
+                "SELECT role,content,model,sender_name,ts FROM ai_messages WHERE session_id=? ORDER BY id ASC",
+                (s["session_id"],)).fetchall()
+            result.append({"session_id": s["session_id"], "updated_at": s["updated_at"],
+                           "messages": [dict(m) for m in msgs]})
+        return {"username": username, "sessions": result}
+    finally:
+        db.close()
+
+@app.post("/admin/ai/sessions/{username}/reply")
+async def admin_reply_to_user(username: str, req: AdminReplyReq,
+                               admin=Depends(require_admin)):
+    """管理员向指定用户的 AI 会话注入一条消息"""
+    if not req.content.strip():
+        raise HTTPException(400, "内容不能为空")
+    db = get_db()
+    try:
+        # 找最新 session
+        row = db.execute(
+            "SELECT session_id FROM ai_sessions WHERE username=? ORDER BY updated_at DESC LIMIT 1",
+            (username,)).fetchone()
+        if not row:
+            raise HTTPException(404, "该用户暂无 AI 对话记录")
+        sid = row["session_id"]
+        now = int(time.time())
+        admin_name = admin.get("sub", "__admin__")
+        db.execute(
+            "INSERT INTO ai_messages (session_id,username,role,content,model,sender_name,ts) VALUES (?,?,?,?,?,?,?)",
+            (sid, username, "admin", req.content.strip(), "", admin_name, now))
+        db.execute("UPDATE ai_sessions SET updated_at=? WHERE session_id=?", (now, sid))
+        db.commit()
+        return {"ok": True, "session_id": sid}
+    finally:
+        db.close()
+
+@app.delete("/admin/ai/sessions/{username}")
+async def admin_delete_user_sessions(username: str, _=Depends(require_admin)):
+    db = get_db()
+    try:
+        sids = [r[0] for r in db.execute("SELECT session_id FROM ai_sessions WHERE username=?", (username,)).fetchall()]
+        for sid in sids:
+            db.execute("DELETE FROM ai_messages WHERE session_id=?", (sid,))
+        db.execute("DELETE FROM ai_sessions WHERE username=?", (username,))
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
 # ── 用户 Profile ─────────────────────────────────────────────────────────────
 @app.get("/api/profile")
 async def get_profile(user=Depends(get_current_user)):
@@ -1062,6 +1225,7 @@ tr:hover td{background:#252840}
     <a href="#" onclick="showTab('cloud')" id="nav-cloud">☁️ 云盘管理</a>
     <div class="section-title">AI</div>
     <a href="#" onclick="showTab('ai')" id="nav-ai">🤖 AI 助手</a>
+    <a href="#" onclick="showTab('aisessions')" id="nav-aisessions">📜 用户AI记录</a>
   </div>
 
   <!-- Main content -->
@@ -1198,6 +1362,23 @@ tr:hover td{background:#252840}
         <div style="font-size:11px;color:#4a5568;margin-top:5px">Ctrl+Enter 发送 · 支持 Claude / DeepSeek / Gemini / Grok / Groq</div>
       </div>
     </div>
+
+    <!-- AI 用户聊天记录 -->
+    <div id="tab-aisessions" style="display:none">
+      <div class="panel">
+        <h2>📜 用户 AI 聊天记录</h2>
+        <div class="toolbar">
+          <input id="aiSessionSearch" placeholder="搜索用户名…" oninput="loadAiSessions(1)">
+          <button class="btn-secondary btn-sm" onclick="loadAiSessions(1)">刷新</button>
+        </div>
+        <div class="tbl-wrap">
+          <table><thead><tr>
+            <th>用户</th><th>消息数</th><th>管理员回复</th><th>最后活跃</th><th>操作</th>
+          </tr></thead><tbody id="aiSessionsTbody"></tbody></table>
+        </div>
+        <div class="pagination" id="aiSessionsPagination"></div>
+      </div>
+    </div>
   </div>
 </div>
 </div>
@@ -1209,6 +1390,32 @@ tr:hover td{background:#252840}
   <div id="aiKeyList" style="margin:14px 0;display:flex;flex-direction:column;gap:8px"></div>
   <div style="font-size:12px;color:#a0aec0;margin-bottom:12px">在 Railway 环境变量中配置对应 Key 后重新部署即可启用</div>
   <div class="modal-footer"><button class="btn-secondary" onclick="closeModal('aiKeyModal')">关闭</button></div>
+</div>
+</div>
+
+<!-- AI 聊天记录查看 & 回复弹窗 -->
+<div class="modal-bg" id="aiChatModal">
+<div class="modal" style="max-width:680px;height:82vh;display:flex;flex-direction:column">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+    <h2 style="margin:0">💬 <span id="aiChatModalTitle">用户对话记录</span></h2>
+    <span style="flex:1"></span>
+    <button class="btn-secondary btn-sm" onclick="deleteAiSession()">🗑 清除记录</button>
+    <button class="btn-secondary btn-sm" onclick="closeModal('aiChatModal')">✕</button>
+  </div>
+  <!-- 消息列表 -->
+  <div id="aiChatMsgs" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:8px;
+    border:1px solid #2d3148;border-radius:10px;padding:14px;margin-bottom:12px;min-height:0"></div>
+  <!-- 管理员回复区 -->
+  <div style="background:#161824;border-radius:10px;padding:12px">
+    <div style="font-size:12px;color:#a0aec0;margin-bottom:7px">✍️ 以管理员身份回复（用户将在 AI 对话中看到）</div>
+    <div style="display:flex;gap:8px;align-items:flex-end">
+      <textarea id="adminReplyInput" rows="2" placeholder="输入回复内容…"
+        style="flex:1;resize:vertical;min-height:48px;max-height:120px;font-size:13px"
+        onkeydown="if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();sendAdminReply();}"></textarea>
+      <button class="btn-primary" id="adminReplyBtn" onclick="sendAdminReply()" style="padding:10px 16px;align-self:stretch">回复</button>
+    </div>
+    <div style="font-size:11px;color:#4a5568;margin-top:4px">Ctrl+Enter 发送</div>
+  </div>
 </div>
 </div>
 
@@ -1325,7 +1532,7 @@ async function doLogin() {
 
 function doLogout() { token=''; location.reload(); }
 
-const TABS = ['overview','users','logs','announce','chat','forum','cloud','ai'];
+const TABS = ['overview','users','logs','announce','chat','forum','cloud','ai','aisessions'];
 function showTab(name) {
   TABS.forEach(t => {
     document.getElementById('tab-'+t).style.display = t===name ? 'block' : 'none';
@@ -1340,6 +1547,7 @@ function showTab(name) {
   else if (name==='forum') loadForum(1);
   else if (name==='cloud') loadCloud(1);
   else if (name==='ai') initAdminAi();
+  else if (name==='aisessions') loadAiSessions(1);
 }
 
 function openModal(id) { document.getElementById(id).classList.add('open'); }
@@ -1906,6 +2114,115 @@ async function sendAdminAi() {
   } finally {
     adminAiBusy = false; btn.disabled = false; btn.textContent = '发送'; input.focus();
   }
+}
+
+// ── AI 用户聊天记录 ────────────────────────────────────────────────────────────
+let _aiSessionsPage = 1;
+let _currentAiUser = '';
+
+async function loadAiSessions(page) {
+  _aiSessionsPage = page;
+  const q = document.getElementById('aiSessionSearch').value.trim();
+  try {
+    const d = await api('GET', `/admin/ai/sessions?page=${page}&q=${encodeURIComponent(q)}`);
+    const tbody = document.getElementById('aiSessionsTbody');
+    tbody.innerHTML = d.sessions.map(s => `
+      <tr>
+        <td><strong>${esc(s.username)}</strong></td>
+        <td>${s.msg_count}</td>
+        <td>${s.admin_count > 0 ? `<span style="color:#48bb78">✅ ${s.admin_count}条</span>` : '<span style="color:#4a5568">—</span>'}</td>
+        <td>${new Date(s.updated_at*1000).toLocaleString('zh-CN')}</td>
+        <td style="display:flex;gap:6px">
+          <button class="btn-primary btn-sm" onclick="openAiChat('${esc(s.username)}')">查看 & 回复</button>
+          <button class="btn-secondary btn-sm" onclick="deleteAiSessionUser('${esc(s.username)}')">🗑</button>
+        </td>
+      </tr>`).join('') || '<tr><td colspan="5" style="text-align:center;color:#4a5568">暂无记录</td></tr>';
+    // 分页
+    const pg = document.getElementById('aiSessionsPagination');
+    pg.innerHTML = '';
+    for (let i=1; i<=d.pages; i++) {
+      const b = document.createElement('button');
+      b.textContent = i; b.className = i===page ? 'active' : '';
+      b.onclick = () => loadAiSessions(i);
+      pg.appendChild(b);
+    }
+  } catch(e) { toast(e.message, true); }
+}
+
+async function openAiChat(username) {
+  _currentAiUser = username;
+  document.getElementById('aiChatModalTitle').textContent = username + ' 的对话记录';
+  document.getElementById('adminReplyInput').value = '';
+  openModal('aiChatModal');
+  await refreshAiChat();
+}
+
+async function refreshAiChat() {
+  try {
+    const d = await api('GET', `/admin/ai/sessions/${encodeURIComponent(_currentAiUser)}`);
+    const el = document.getElementById('aiChatMsgs');
+    if (!d.sessions || d.sessions.length === 0) {
+      el.innerHTML = '<div style="text-align:center;color:#4a5568;padding:30px">暂无对话记录</div>';
+      return;
+    }
+    // 合并所有 session 消息并排序
+    let allMsgs = [];
+    for (const s of d.sessions) {
+      for (const m of s.messages) allMsgs.push({...m, session_id: s.session_id});
+    }
+    allMsgs.sort((a,b) => a.ts - b.ts);
+    el.innerHTML = allMsgs.map(m => {
+      const isUser   = m.role === 'user';
+      const isAdmin  = m.role === 'admin';
+      const isAI     = m.role === 'assistant';
+      let bgColor, label, labelColor;
+      if (isUser)  { bgColor='#2d3550'; label='👤 用户';     labelColor='#a0aec0'; }
+      if (isAI)    { bgColor='#1e2a1e'; label='🤖 AI';       labelColor='#68d391'; }
+      if (isAdmin) { bgColor='#2d1e1e'; label='🛡 管理员回复'; labelColor='#fc8181'; }
+      const modelTag = (isAI && m.model) ? `<span style="font-size:10px;color:#4a5568;margin-left:6px">[${esc(m.model)}]</span>` : '';
+      const adminTag = (isAdmin && m.sender_name) ? `<span style="font-size:10px;color:#4a5568;margin-left:6px">by ${esc(m.sender_name)}</span>` : '';
+      const timeStr  = new Date(m.ts*1000).toLocaleTimeString('zh-CN');
+      return `<div style="background:${bgColor};border-radius:8px;padding:10px 12px">
+        <div style="font-size:11px;color:${labelColor};margin-bottom:5px;display:flex;align-items:center">
+          ${label}${modelTag}${adminTag}
+          <span style="margin-left:auto;color:#4a5568">${timeStr}</span>
+        </div>
+        <div style="font-size:13px;color:#e2e8f0;white-space:pre-wrap;word-break:break-word;line-height:1.6">${esc(m.content)}</div>
+      </div>`;
+    }).join('');
+    el.scrollTop = el.scrollHeight;
+  } catch(e) { toast(e.message, true); }
+}
+
+async function sendAdminReply() {
+  const btn = document.getElementById('adminReplyBtn');
+  const input = document.getElementById('adminReplyInput');
+  const content = input.value.trim();
+  if (!content) return;
+  btn.disabled = true; btn.textContent = '⏳';
+  try {
+    await api('POST', `/admin/ai/sessions/${encodeURIComponent(_currentAiUser)}/reply`, {content});
+    input.value = '';
+    toast('回复已发送');
+    await refreshAiChat();
+    loadAiSessions(_aiSessionsPage);
+  } catch(e) { toast(e.message, true); }
+  finally { btn.disabled = false; btn.textContent = '回复'; }
+}
+
+async function deleteAiSession() {
+  if (!confirm(`确定清除 ${_currentAiUser} 的所有 AI 对话记录？`)) return;
+  await deleteAiSessionUser(_currentAiUser);
+  closeModal('aiChatModal');
+}
+
+async function deleteAiSessionUser(username) {
+  if (!confirm(`确定清除 ${username} 的所有 AI 对话记录？`)) return;
+  try {
+    await api('DELETE', `/admin/ai/sessions/${encodeURIComponent(username)}`);
+    toast('已清除');
+    loadAiSessions(_aiSessionsPage);
+  } catch(e) { toast(e.message, true); }
 }
 </script>
 </body>
