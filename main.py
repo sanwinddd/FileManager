@@ -173,6 +173,7 @@ class RegisterReq(BaseModel):
     device:   dict = {}
 
 class AdminLoginReq(BaseModel):
+    username: Optional[str] = None
     password: str
 
 class UpdateUserReq(BaseModel):
@@ -180,6 +181,7 @@ class UpdateUserReq(BaseModel):
     role:     Optional[str]  = None
     banned:   Optional[bool] = None
     password: Optional[str]  = None
+    avatar:   Optional[str]  = None   # base64图片或""（清除）
 
 class ChangePasswordReq(BaseModel):
     old_password: str
@@ -262,10 +264,31 @@ async def me(user=Depends(get_current_user)):
 # ── 管理员接口 ────────────────────────────────────────────────────────────────
 @app.post("/admin/login")
 async def admin_login(req: AdminLoginReq):
-    if not hmac.compare_digest(req.password, ADMIN_PASS):
-        raise HTTPException(401, "管理员密码错误")
-    token = make_token("__admin__", "admin")
-    return {"token": token}
+    # 方式1：纯密码登录（ADMIN_PASSWORD 环境变量，兼容旧模式）
+    if not req.username:
+        if not hmac.compare_digest(req.password, ADMIN_PASS):
+            raise HTTPException(401, "管理员密码错误")
+        token = make_token("__admin__", "admin")
+        return {"token": token, "username": "__admin__"}
+    # 方式2：用户名+密码登录（数据库中 role=admin 的用户）
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT username, pw_hash, role, banned FROM users WHERE username=?",
+            (req.username,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(401, "用户名或密码错误")
+        if row["banned"]:
+            raise HTTPException(403, "账号已被封禁")
+        if row["role"] != "admin":
+            raise HTTPException(403, "该账号没有管理员权限")
+        if not hmac.compare_digest(hash_pw(req.password), row["pw_hash"]):
+            raise HTTPException(401, "用户名或密码错误")
+        token = make_token(row["username"], "admin")
+        return {"token": token, "username": row["username"]}
+    finally:
+        db.close()
 
 @app.get("/admin/users")
 async def list_users(page: int = 1, q: str = "", _=Depends(require_admin)):
@@ -318,6 +341,9 @@ async def update_user(username: str, req: UpdateUserReq, _=Depends(require_admin
         if req.password is not None and req.password != "":
             if len(req.password) < 4: raise HTTPException(400, "密码至少4位")
             fields.append("pw_hash=?"); vals.append(hash_pw(req.password))
+        if req.avatar is not None:
+            if len(req.avatar) > 400_000: raise HTTPException(400, "头像数据过大")
+            fields.append("avatar=?"); vals.append(req.avatar)
         if not fields: raise HTTPException(400, "无更新内容")
         vals.append(username)
         db.execute(f"UPDATE users SET {','.join(fields)} WHERE username=?", vals)
@@ -682,8 +708,10 @@ async def upload_file(request: Request, user=Depends(get_current_user)):
         count = db.execute("SELECT COUNT(*) FROM cloud_files WHERE owner=?", (user["sub"],)).fetchone()[0]
         if count >= 100: raise HTTPException(400, "云盘文件数量已达上限(100个)")
         import uuid
-        fid  = str(uuid.uuid4())
-        path = os.path.join(CLOUD_DIR, fid)
+        fid      = str(uuid.uuid4())
+        user_dir = os.path.join(CLOUD_DIR, user["sub"])
+        os.makedirs(user_dir, exist_ok=True)
+        path = os.path.join(user_dir, fid)
         with open(path, "wb") as f: f.write(file_bytes)
         db.execute("INSERT INTO cloud_files (id,owner,filename,size,created_at) VALUES (?,?,?,?,?)",
                    (fid, user["sub"], filename, len(file_bytes), int(time.time())))
@@ -696,9 +724,32 @@ async def upload_file(request: Request, user=Depends(get_current_user)):
 async def download_file(fid: str, user=Depends(get_current_user)):
     db = get_db()
     try:
-        row = db.execute("SELECT * FROM cloud_files WHERE id=? AND owner=?", (fid, user["sub"])).fetchone()
+        # 管理员可下载任意文件，普通用户只能下载自己的
+        if user.get("role") == "admin":
+            row = db.execute("SELECT * FROM cloud_files WHERE id=?", (fid,)).fetchone()
+        else:
+            row = db.execute("SELECT * FROM cloud_files WHERE id=? AND owner=?", (fid, user["sub"])).fetchone()
         if not row: raise HTTPException(404, "文件不存在")
-        path = os.path.join(CLOUD_DIR, fid)
+        # 兼容旧路径（扁平）和新路径（按用户分目录）
+        path_flat = os.path.join(CLOUD_DIR, fid)
+        path_user = os.path.join(CLOUD_DIR, row["owner"], fid)
+        path = path_user if os.path.exists(path_user) else path_flat
+        if not os.path.exists(path): raise HTTPException(404, "文件已丢失")
+        import base64
+        with open(path, "rb") as f: raw = f.read()
+        return {"filename": row["filename"], "data": base64.b64encode(raw).decode(), "size": len(raw)}
+    finally:
+        db.close()
+
+@app.get("/admin/cloud/download/{fid}")
+async def admin_download_file(fid: str, _=Depends(require_admin)):
+    db = get_db()
+    try:
+        row = db.execute("SELECT * FROM cloud_files WHERE id=?", (fid,)).fetchone()
+        if not row: raise HTTPException(404, "文件不存在")
+        path_flat = os.path.join(CLOUD_DIR, fid)
+        path_user = os.path.join(CLOUD_DIR, row["owner"], fid)
+        path = path_user if os.path.exists(path_user) else path_flat
         if not os.path.exists(path): raise HTTPException(404, "文件已丢失")
         import base64
         with open(path, "rb") as f: raw = f.read()
@@ -812,8 +863,20 @@ tr:hover td{background:#252840}
 <div class="card">
   <h1>🛡 管理后台</h1>
   <p style="color:#a0aec0;font-size:13px;margin-bottom:20px">File Manager Pro</p>
-  <div style="margin-bottom:12px"><input type="password" id="adminPw" placeholder="管理员密码" onkeydown="if(event.key==='Enter')doLogin()"></div>
-  <button class="btn-primary" style="width:100%;padding:12px" onclick="doLogin()">登 录</button>
+  <div style="margin-bottom:8px">
+    <div class="tabs" style="margin-bottom:12px">
+      <button class="tab-btn active" id="loginTab1" onclick="switchLoginTab(1)">账号登录</button>
+      <button class="tab-btn" id="loginTab2" onclick="switchLoginTab(2)">主密码登录</button>
+    </div>
+    <div id="loginPane1">
+      <div style="margin-bottom:10px"><input id="adminUsername" placeholder="管理员用户名" onkeydown="if(event.key==='Enter')doLogin()"></div>
+      <div><input type="password" id="adminPw" placeholder="密码" onkeydown="if(event.key==='Enter')doLogin()"></div>
+    </div>
+    <div id="loginPane2" style="display:none">
+      <input type="password" id="adminMasterPw" placeholder="环境变量主密码" onkeydown="if(event.key==='Enter')doLogin()">
+    </div>
+  </div>
+  <button class="btn-primary" style="width:100%;padding:12px;margin-top:12px" onclick="doLogin()">登 录</button>
   <div id="loginErr" style="color:#f08080;font-size:13px;margin-top:10px;text-align:center"></div>
 </div>
 </div>
@@ -931,7 +994,7 @@ tr:hover td{background:#252840}
           <button class="btn-secondary btn-sm" onclick="loadCloud(1)">刷新</button>
         </div>
         <div class="tbl-wrap"><table><thead><tr>
-          <th>用户</th><th>文件名</th><th>大小</th><th>上传时间</th><th>操作</th>
+          <th style="width:32px"></th><th>文件名</th><th>大小</th><th>上传时间</th><th>操作</th>
         </tr></thead><tbody id="cloudTbody"></tbody></table></div>
         <div class="pagination" id="cloudPagination"></div>
         <div id="cloudStats" style="margin-top:12px;color:#a0aec0;font-size:12px"></div>
@@ -946,6 +1009,20 @@ tr:hover td{background:#252840}
 <div class="modal">
   <h2 id="userModalTitle">编辑用户</h2>
   <input type="hidden" id="editUsername">
+  <!-- 头像预览 + 上传 -->
+  <div class="row" style="display:flex;align-items:center;gap:14px">
+    <div id="editAvPreview" style="width:56px;height:56px;border-radius:50%;background:#252840;display:flex;align-items:center;justify-content:center;font-size:22px;overflow:hidden;flex-shrink:0;border:2px solid #2d3148"></div>
+    <div style="flex:1;min-width:0">
+      <label style="display:block;font-size:12px;color:#a0aec0;margin-bottom:6px">头像（选择图片文件，PNG/JPG ≤300KB）</label>
+      <div style="display:flex;gap:6px">
+        <input type="file" id="editAvFile" accept="image/png,image/jpeg" style="display:none" onchange="previewAvatar(this)">
+        <button class="btn-secondary btn-sm" onclick="document.getElementById('editAvFile').click()">📂 选择图片</button>
+        <button class="btn-secondary btn-sm" onclick="clearAvatar()">🗑 清除头像</button>
+      </div>
+      <div id="editAvStatus" style="font-size:11px;color:#a0aec0;margin-top:4px"></div>
+    </div>
+  </div>
+  <input type="hidden" id="editAvatarData">
   <div class="row"><label>邮箱</label><input id="editEmail" placeholder="邮箱（可选）"></div>
   <div class="row"><label>角色</label><select id="editRole"><option value="user">普通用户</option><option value="admin">管理员</option></select></div>
   <div class="row"><label>新密码（留空不改）</label><input type="password" id="editPassword" placeholder="新密码"></div>
@@ -1008,11 +1085,30 @@ function toast(msg, err=false) {
   t.style.display = 'block'; setTimeout(() => t.style.display='none', 2500);
 }
 
+let loginTabMode = 1;
+function switchLoginTab(n) {
+  loginTabMode = n;
+  document.getElementById('loginPane1').style.display = n===1 ? 'block' : 'none';
+  document.getElementById('loginPane2').style.display = n===2 ? 'block' : 'none';
+  document.getElementById('loginTab1').classList.toggle('active', n===1);
+  document.getElementById('loginTab2').classList.toggle('active', n===2);
+}
+
 async function doLogin() {
-  const pw = document.getElementById('adminPw').value;
+  let body;
+  if (loginTabMode === 1) {
+    const username = document.getElementById('adminUsername').value.trim();
+    const pw = document.getElementById('adminPw').value;
+    if (!username) { document.getElementById('loginErr').textContent = '⚠ 请输入用户名'; return; }
+    body = {username, password: pw};
+  } else {
+    body = {password: document.getElementById('adminMasterPw').value};
+  }
   try {
-    const d = await api('POST', '/admin/login', {password: pw});
+    const d = await api('POST', '/admin/login', body);
     token = d.token;
+    const badge = document.getElementById('adminBadge');
+    badge.textContent = d.username && d.username !== '__admin__' ? d.username : '管理员';
     document.getElementById('loginView').style.display = 'none';
     document.getElementById('app').style.display = 'flex';
     showTab('overview');
@@ -1090,7 +1186,7 @@ async function loadUsers(page=1) {
         <td>${esc(u.last_ip||'—')}</td>
         <td>${u.banned?'<span class="tag tag-banned">封禁</span>':'<span style="color:#48bb78;font-size:12px">正常</span>'}</td>
         <td style="white-space:nowrap">
-          <button class="btn-secondary btn-sm" onclick="editUser('${esc(u.username)}','${esc(u.email||'')}','${u.role}',${u.banned})">编辑</button>
+          <button class="btn-secondary btn-sm" onclick="editUser('${esc(u.username)}','${esc(u.email||'')}','${u.role}',${u.banned},'${u.avatar && u.avatar.length > 50 ? '__img__' : esc(u.avatar||'')}','${u.avatar && u.avatar.length > 50 ? u.avatar : ''}')">编辑</button>
           <button class="btn-danger btn-sm" onclick="delUser('${esc(u.username)}')">删除</button>
         </td>
       </tr>`;
@@ -1099,15 +1195,50 @@ async function loadUsers(page=1) {
   } catch(e) { toast('加载失败: '+e.message, true); }
 }
 
-function editUser(uname, email, role, banned) {
+function editUser(uname, email, role, banned, avShort, avB64) {
   document.getElementById('editUsername').value = uname;
   document.getElementById('editEmail').value = email;
   document.getElementById('editRole').value = role;
   document.getElementById('editBanned').value = banned;
   document.getElementById('editPassword').value = '';
+  document.getElementById('editAvatarData').value = '';   // no change by default
+  document.getElementById('editAvFile').value = '';
+  document.getElementById('editAvStatus').textContent = '';
   document.getElementById('userModalTitle').textContent = '编辑用户 — ' + uname;
   document.getElementById('userModalErr').textContent = '';
+  // render avatar preview
+  const prev = document.getElementById('editAvPreview');
+  if (avB64 && avB64.length > 50) {
+    prev.innerHTML = `<img src="data:image/png;base64,${avB64}" style="width:100%;height:100%;object-fit:cover;border-radius:50%">`;
+  } else {
+    prev.textContent = avShort || uname.charAt(0).toUpperCase();
+  }
   openModal('userModal');
+}
+
+function previewAvatar(input) {
+  const file = input.files[0];
+  if (!file) return;
+  if (file.size > 300_000) {
+    document.getElementById('editAvStatus').textContent = '❌ 文件超过 300KB';
+    input.value = ''; return;
+  }
+  const reader = new FileReader();
+  reader.onload = e => {
+    const b64 = e.target.result.split(',')[1];
+    document.getElementById('editAvatarData').value = b64;
+    document.getElementById('editAvPreview').innerHTML =
+      `<img src="${e.target.result}" style="width:100%;height:100%;object-fit:cover;border-radius:50%">`;
+    document.getElementById('editAvStatus').textContent = `✅ 已选择: ${file.name}`;
+  };
+  reader.readAsDataURL(file);
+}
+
+function clearAvatar() {
+  document.getElementById('editAvatarData').value = '__clear__';
+  document.getElementById('editAvPreview').textContent = '🚫';
+  document.getElementById('editAvStatus').textContent = '头像将被清除';
+  document.getElementById('editAvFile').value = '';
 }
 
 async function saveUser() {
@@ -1119,6 +1250,9 @@ async function saveUser() {
   };
   const pw = document.getElementById('editPassword').value;
   if (pw) body.password = pw;
+  const avData = document.getElementById('editAvatarData').value;
+  if (avData === '__clear__') body.avatar = '';
+  else if (avData) body.avatar = avData;
   try {
     await api('PATCH', `/admin/users/${encodeURIComponent(uname)}`, body);
     toast('✅ 已更新'); closeModal('userModal'); loadUsers(usersPage);
@@ -1335,27 +1469,53 @@ async function loadCloud(page=1) {
   try {
     const d = await api('GET', `/admin/cloud/files?username=${encodeURIComponent(q)}&page=${page}`);
     const tbody = document.getElementById('cloudTbody');
-    tbody.innerHTML = (d.files||[]).map(f => `<tr>
-      <td>${esc(f.owner)}</td>
-      <td title="${esc(f.filename)}">${esc(f.filename)}</td>
-      <td>${fmtSize(f.size)}</td>
-      <td>${fmtTs(f.created_at)}</td>
-      <td style="white-space:nowrap">
-        <button class="btn-success btn-sm" onclick="downloadFile('${f.id}','${esc(f.filename)}')">⬇ 下载</button>
-        <button class="btn-danger btn-sm" onclick="delCloudFile('${f.id}','${esc(f.owner)}')">🗑 删除</button>
-      </td>
-    </tr>`).join('');
+    const files = d.files || [];
+
+    // 按用户分组
+    const groups = {};
+    for (const f of files) {
+      if (!groups[f.owner]) groups[f.owner] = [];
+      groups[f.owner].push(f);
+    }
+
+    let html = '';
+    for (const owner of Object.keys(groups).sort()) {
+      const ufiles = groups[owner];
+      const uBytes = ufiles.reduce((s,f)=>s+f.size, 0);
+      // 用户分组标题行
+      html += `<tr style="background:#161824">
+        <td colspan="5" style="padding:8px 12px">
+          <span style="font-weight:700;color:#7c83ff">👤 ${esc(owner)}</span>
+          <span style="color:#a0aec0;font-size:12px;margin-left:10px">${ufiles.length} 个文件 · ${fmtSize(uBytes)}</span>
+        </td>
+      </tr>`;
+      for (const f of ufiles) {
+        html += `<tr>
+          <td style="color:#a0aec0;padding-left:24px">└</td>
+          <td title="${esc(f.filename)}">${esc(f.filename)}</td>
+          <td>${fmtSize(f.size)}</td>
+          <td>${fmtTs(f.created_at)}</td>
+          <td style="white-space:nowrap">
+            <button class="btn-success btn-sm" onclick="downloadFile('${f.id}','${esc(f.filename)}')">⬇ 下载</button>
+            <button class="btn-danger btn-sm" onclick="delCloudFile('${f.id}','${esc(f.owner)}')">🗑 删除</button>
+          </td>
+        </tr>`;
+      }
+    }
+    if (!html) html = `<tr><td colspan="5" style="color:#a0aec0;text-align:center;padding:20px">暂无文件</td></tr>`;
+    tbody.innerHTML = html;
+
     renderPagination('cloudPagination', d.page||1, d.pages||1, loadCloud);
-    const totalBytes = (d.files||[]).reduce((s,f)=>s+f.size,0);
+    const totalBytes = files.reduce((s,f)=>s+f.size, 0);
     document.getElementById('cloudStats').textContent =
-      `共 ${d.total||d.files.length} 个文件，本页合计 ${fmtSize(totalBytes)}`;
+      `共 ${d.total||files.length} 个文件 · ${Object.keys(groups).length} 位用户 · 本页合计 ${fmtSize(totalBytes)}`;
   } catch(e) { toast('加载失败: '+e.message, true); }
 }
 
 async function downloadFile(fid, fname) {
   try {
     toast('⏳ 准备下载…');
-    const d = await api('GET', `/api/cloud/download/${fid}`);
+    const d = await api('GET', `/admin/cloud/download/${fid}`);
     const b64 = d.data;
     const raw = atob(b64);
     const bytes = new Uint8Array(raw.length);
